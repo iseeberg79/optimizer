@@ -89,6 +89,12 @@ type BatteryConfig struct {
 
 	// SMin Minimum state of charge in Wh
 	SMin float32 `json:"s_min"`
+
+	// WithholdCharge Signals that the battery hardware can actively pause charging (e.g. hold/stop charge).
+	// - True: under the attenuate_grid_peaks strategy the optimizer may withhold charging below the
+	//   solar peak to keep capacity available for peak shaving, accepting cost-neutral surplus export.
+	// - False: (default) the strategy may only re-time (defer) charging, never forgo it.
+	WithholdCharge bool `json:"withhold_charge,omitempty"`
 }
 
 // BatteryResult defines model for BatteryResult.
@@ -200,7 +206,9 @@ type OptimizerStrategy struct {
 	// ChargingStrategy Sets a strategy for charging in situations where choices are cost neutral.
 	// - none (default): no strategy set
 	// - charge_before_export: charge batteries before exporting to grid
-	// - attenuate_grid_peaks: charge at times with high solar yield to reduce the grid load
+	// - attenuate_grid_peaks: charge at times with high solar yield to reduce the grid load.
+	//   For batteries with `withhold_charge: true` the strategy may also actively withhold charging
+	//   below the solar peak to keep capacity available for the peak, not just defer it.
 	ChargingStrategy OptimizerStrategyChargingStrategy `json:"charging_strategy,omitempty"`
 
 	// DischargingStrategy Sets a strategy for charging in situations where choices are cost neutral.
@@ -210,9 +218,11 @@ type OptimizerStrategy struct {
 }
 
 // OptimizerStrategyChargingStrategy Sets a strategy for charging in situations where choices are cost neutral.
-// - none (default): no strategy set
-// - charge_before_export: charge batteries before exporting to grid
-// - attenuate_grid_peaks: charge at times with high solar yield to reduce the grid load
+//   - none (default): no strategy set
+//   - charge_before_export: charge batteries before exporting to grid
+//   - attenuate_grid_peaks: charge at times with high solar yield to reduce the grid load.
+//     For batteries with `withhold_charge: true` the strategy may also actively withhold charging
+//     below the solar peak to keep capacity available for the peak, not just defer it.
 type OptimizerStrategyChargingStrategy string
 
 // OptimizerStrategyDischargingStrategy Sets a strategy for charging in situations where choices are cost neutral.
