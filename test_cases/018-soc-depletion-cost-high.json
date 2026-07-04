@@ -1,0 +1,83 @@
+{
+  "request": {
+    "batteries": [
+      {
+        "charge_from_grid": false,
+        "discharge_to_grid": true,
+        "s_capacity": 10000,
+        "s_min": 0,
+        "s_max": 10000,
+        "s_initial": 9500,
+        "c_min": 0,
+        "c_max": 5000,
+        "d_max": 5000,
+        "p_a": 0.0002,
+        "prc_dpl_soc_high": 1.0
+      }
+    ],
+    "eta_c": 1.0,
+    "eta_d": 1.0,
+    "grid": {},
+    "strategy": {
+      "charging_strategy": "charge_before_export",
+      "discharging_strategy": "discharge_before_import"
+    },
+    "time_series": {
+      "dt": [
+        900,
+        900,
+        900,
+        900,
+        900,
+        900,
+        900,
+        900
+      ],
+      "ft": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "gt": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "p_N": [
+        0.0003,
+        0.0003,
+        0.0003,
+        0.0003,
+        0.0003,
+        0.0003,
+        0.0003,
+        0.0003
+      ],
+      "p_E": [
+        0.0001,
+        0.0001,
+        0.0001,
+        0.0001,
+        0.0001,
+        0.0001,
+        0.0001,
+        0.0001
+      ]
+    }
+  },
+  "expected_response": {
+    "status": "Optimal",
+    "objective_value": 0.09999999999999999
+  },
+  "test_items": {}
+}
