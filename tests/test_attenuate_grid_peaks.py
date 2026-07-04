@@ -21,7 +21,7 @@ def _solve(withhold_charge: bool):
         charging_strategy='attenuate_grid_peaks',
         discharging_strategy='none',
     )
-    grid = GridConfig(p_max_imp=None, p_max_exp=None, prc_p_exc_imp=None)
+    grid = GridConfig(p_max_imp=None, p_max_exp=200, prc_p_exc_imp=None)
     battery = BatteryConfig(
         charge_from_grid=False,
         discharge_to_grid=False,

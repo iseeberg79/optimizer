@@ -311,6 +311,12 @@ class Optimizer:
 
         # prefer charging at high solar production times to unload public grid from peaks
         if self.strategy.charging_strategy == 'attenuate_grid_peaks':
+            peak_overshoot_slot = None
+            if self.grid.p_max_exp is not None:
+                for t in self.time_steps:
+                    if self.time_series.ft[t] - self.time_series.gt[t] > self.grid.p_max_exp * self.time_series.dt[t] / 3600.:
+                        peak_overshoot_slot = t
+                        break
             for i, bat in enumerate(self.batteries):
                 for t in self.time_steps:
                     # defer charging towards high solar production (attenuates the export peak)
@@ -318,7 +324,7 @@ class Optimizer:
                     # if the battery hardware can pause charging, actively withhold charging below the
                     # solar peak so capacity stays available to absorb the peak. Without this capability the
                     # strategy may only re-time (defer) charging, not forgo it.
-                    if bat.withhold_charge:
+                    if bat.withhold_charge and peak_overshoot_slot is not None and t < peak_overshoot_slot:
                         objective -= self.variables['c'][i][t] * (self.max_solar - self.time_series.ft[t]) * self.min_import_price * 1e-6
 
         # prefer discharging batteries completely before importing from grid
