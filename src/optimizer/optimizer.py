@@ -94,6 +94,7 @@ class BatteryConfig:
     p_demand: Optional[List[float]] = None  # Minimum charge demand (Wh)
     s_goal: Optional[List[float]] = None  # Goal state of charge (Wh)
     c_priority: int = 0
+    prc_dpl_soc_high: float = 0.0  # price (€/h) for life depletion while sitting above 80% SOC
 
 
 @dataclass
@@ -310,6 +311,15 @@ class Optimizer:
                 for t in self.time_steps
             ]
 
+        # Cost variable for battery life depletion while sitting at very high SOC (>80%).
+        # lowBound=0 makes the "no cost below 80%" floor implicit.
+        self.variables['cst_dpl_high'] = {}
+        for i in range(len(self.batteries)):
+            self.variables['cst_dpl_high'][i] = [
+                pulp.LpVariable(f"cst_dpl_high_{i}_{t}", lowBound=0)
+                for t in self.time_steps
+            ]
+
     def _setup_target_function(self):
         """
         Gather all target function contributions and instantiate the objective
@@ -345,6 +355,11 @@ class Optimizer:
         # Final state of charge value [currency unit]
         for i, bat in enumerate(self.batteries):
             objective += self.variables['s'][i][-1] * bat.p_a
+
+        # cost for depleting battery life by sitting at very high SOC (calendar aging)
+        for i in range(len(self.batteries)):
+            for t in self.time_steps:
+                objective += - self.variables['cst_dpl_high'][i][t]
 
         # charge for import power demand rate. The demand rate is applied to the maximum
         # power draw beyond the threshold within the time horizon.
@@ -637,6 +652,19 @@ class Optimizer:
                 # Charge constraint
                 self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
                                  * (1 - self.variables['z_cd'][i][t]))
+
+            # cost for depleting battery life by sitting at very high SOC (calendar aging).
+            # linear ramp: zero at 80% SOC, full prc_dpl_soc_high at 100% SOC.
+            # capacity: s_capacity if set, else s_max (guard against div by zero).
+            if bat.prc_dpl_soc_high > 0:
+                bat_capacity = bat.s_capacity if (bat.s_capacity is not None and bat.s_capacity > 0.0) else bat.s_max
+                bat_capacity = max(bat_capacity, 1.0)
+                for t in self.time_steps:
+                    # scale the €/h price to the slot width
+                    prc = bat.prc_dpl_soc_high / 3600.0 * self.time_series.dt[t]
+                    self.problem += (self.variables['cst_dpl_high'][i][t]
+                                     >= (prc / (0.2 * bat_capacity))
+                                     * (self.variables['s'][i][t] - 0.8 * bat_capacity))
 
     def solve(self) -> Dict:
         """
