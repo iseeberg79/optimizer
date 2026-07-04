@@ -81,7 +81,8 @@ battery_config_model = api.model('BatteryConfig', {
     'withhold_charge': fields.Boolean(
         required=False,
         description='Battery can actively pause charging; lets the attenuate_grid_peaks strategy '
-                    'withhold (not just defer) charging below the solar peak to reserve capacity.')
+                    'withhold (not just defer) charging below the solar peak to reserve capacity.'),
+    'prc_dpl_soc_high': fields.Float(required=False, description='Price (€/h) for higher battery life depletion when sitting above 80% SOC.')
 })
 
 time_series_model = api.model('TimeSeries', {
@@ -173,6 +174,7 @@ class OptimizeCharging(Resource):
                     p_a=bat_data['p_a'],
                     c_priority=bat_data.get('c_priority', 0),
                     withhold_charge=bat_data.get('withhold_charge', False),
+                    prc_dpl_soc_high=bat_data.get('prc_dpl_soc_high', 0.0),
                 ))
 
             # Parse time series data

@@ -279,6 +279,13 @@ components:
             - True: under the attenuate_grid_peaks strategy the optimizer may withhold charging below the
               solar peak to keep capacity available for peak shaving, accepting cost-neutral surplus export.
             - False: (default) the strategy may only re-time (defer) charging, never forgo it.
+        prc_dpl_soc_high:
+          type: number
+          minimum: 0
+          description: |
+            Price (€/h) for higher battery life depletion when sitting at high SOC.
+            A linear cost model is applied, starting at 80% SOC, applying full price at 100% SOC.
+            The battery capacity is assumed to be s_capacity or s_max if s_capacity is not specified.
 
     TimeSeries:
       type: object
