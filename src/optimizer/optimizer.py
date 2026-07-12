@@ -108,6 +108,14 @@ class Optimizer:
         if self.grid.p_max_imp is not None and self.grid.prc_p_exc_imp is not None:
             self.is_grid_demand_rate_active = True
 
+        # feed-in peak shaping is part of the attenuate_grid_peaks strategy: a convex penalty on
+        # the feed-in power spreads/flattens the export so the battery charges as a smooth ramp
+        # (not a bang-bang block) and keeps capacity to absorb the midday peak.
+        self.is_export_peak_active = self.strategy.charging_strategy == 'attenuate_grid_peaks'
+        # number of segments for the convex (piecewise-linear) feed-in penalty; more segments
+        # approximate the quadratic more finely and distinguish a smooth spread from a residual peak
+        self.n_export_segments = 8
+
     def create_model(self):
         """
         Create and initialize the MILP model
@@ -177,6 +185,18 @@ class Optimizer:
         # Grid import/export variables [Wh]
         self.variables['n'] = [pulp.LpVariable(f"n_{t}", lowBound=0) for t in self.time_steps]
         self.variables['e'] = [pulp.LpVariable(f"e_{t}", lowBound=0) for t in self.time_steps]
+
+        # feed-in shaping (attenuate_grid_peaks): decompose each slot's export energy into segments
+        # of increasing marginal penalty (a convex, LP-friendly penalty). The last segment is
+        # unbounded so any export level stays feasible; the lower segments have width export_seg_width.
+        if self.is_export_peak_active:
+            self.export_seg_width = (np.max(self.time_series.ft) / self.n_export_segments) if len(self.time_series.ft) else 0.0
+            self.variables['e_seg'] = [
+                [pulp.LpVariable(f"e_seg_{t}_{k}", lowBound=0,
+                                 upBound=(self.export_seg_width if k < self.n_export_segments - 1 else None))
+                 for k in range(self.n_export_segments)]
+                for t in self.time_steps
+            ]
 
         # penalty variables for exceeding grid power limits (W)
         # for grid import
@@ -324,7 +344,7 @@ class Optimizer:
                 for t in self.time_steps:
                     objective += - self.variables['e'][t] * self.min_import_price * 2e-5 * (self.T - t)
 
-        # prefer charging at high solar production times to unload public grid from peaks
+        # attenuate the public grid load at the midday peak
         if self.strategy.charging_strategy == 'attenuate_grid_peaks':
             peak_overshoot_slot = None
             if self.grid.p_max_exp is not None:
@@ -332,15 +352,21 @@ class Optimizer:
                     if self.time_series.ft[t] - self.time_series.gt[t] > self.grid.p_max_exp * self.time_series.dt[t] / 3600.:
                         peak_overshoot_slot = t
                         break
+            # convex feed-in penalty: increasing marginal cost per segment ((2k+1) approximates the
+            # derivative of a quadratic). Minimising it spreads charging into a smooth ramp and
+            # flattens the export, instead of the bang-bang block a plain defer term produces.
+            # Secondary tie-breaker magnitude, so filling the battery and real arbitrage dominate.
+            base = self.min_import_price * 1e-3
+            for t in self.time_steps:
+                for k in range(self.n_export_segments):
+                    objective += - base * (2 * k + 1) * self.variables['e_seg'][t][k]
+            # if the battery hardware can pause charging, actively withhold charging below the solar
+            # peak so capacity stays available to absorb the peak (hard export cap / curtailment case).
+            # Kept above the shaping magnitude so it still governs its slots when enabled.
             for i, bat in enumerate(self.batteries):
                 for t in self.time_steps:
-                    # defer charging towards high solar production (attenuates the export peak)
-                    objective += self.variables['c'][i][t] * self.time_series.ft[t] * self.min_import_price * 1e-6
-                    # if the battery hardware can pause charging, actively withhold charging below the
-                    # solar peak so capacity stays available to absorb the peak. Without this capability the
-                    # strategy may only re-time (defer) charging, not forgo it.
                     if bat.withhold_charge and peak_overshoot_slot is not None and t < peak_overshoot_slot:
-                        objective -= self.variables['c'][i][t] * (self.max_solar - self.time_series.ft[t]) * self.min_import_price * 1e-6
+                        objective -= self.variables['c'][i][t] * (self.max_solar - self.time_series.ft[t]) * self.min_import_price * 2e-3
 
         # prefer discharging batteries completely before importing from grid
         if self.strategy.discharging_strategy == 'discharge_before_import':
@@ -439,6 +465,12 @@ class Optimizer:
             for t in self.time_steps:
                 self.problem += self.variables['e_imp_lim_exc'][t] \
                     <= self.variables['p_max_imp_exc'] * self.time_series.dt[t] / 3600
+
+        # feed-in shaping (attenuate_grid_peaks): tie the export segments to each slot's export
+        # energy, so the convex per-segment penalty in the objective applies to the actual feed-in.
+        if self.is_export_peak_active:
+            for t in self.time_steps:
+                self.problem += self.variables['e'][t] == pulp.lpSum(self.variables['e_seg'][t])
 
     def _add_battery_constraints(self):
         """
