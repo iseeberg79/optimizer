@@ -95,6 +95,7 @@ class BatteryConfig:
     s_goal: Optional[List[float]] = None  # Goal state of charge (Wh)
     c_priority: int = 0
     prc_dpl_soc_high: float = 0.0  # price (€/h) for life depletion while sitting above 80% SOC
+    prc_dpl_soc_low: float = 0.0  # price (€/h) for reserve comfort while sitting below 20% SOC (soft buffer, not aging)
 
 
 @dataclass
@@ -320,6 +321,16 @@ class Optimizer:
                 for t in self.time_steps
             ]
 
+        # Cost variable for keeping a reserve buffer while sitting at very low SOC (<20%).
+        # Not aging (low SOC is gentle) but a comfort/reserve preference: a soft buffer for
+        # spontaneous loads / forecast deviation. lowBound=0 makes the "no cost above 20%" floor implicit.
+        self.variables['cst_dpl_low'] = {}
+        for i in range(len(self.batteries)):
+            self.variables['cst_dpl_low'][i] = [
+                pulp.LpVariable(f"cst_dpl_low_{i}_{t}", lowBound=0)
+                for t in self.time_steps
+            ]
+
     def _setup_target_function(self):
         """
         Gather all target function contributions and instantiate the objective
@@ -360,6 +371,11 @@ class Optimizer:
         for i in range(len(self.batteries)):
             for t in self.time_steps:
                 objective += - self.variables['cst_dpl_high'][i][t]
+
+        # cost for sitting at very low SOC (reserve comfort - keep a soft buffer for deviations)
+        for i in range(len(self.batteries)):
+            for t in self.time_steps:
+                objective += - self.variables['cst_dpl_low'][i][t]
 
         # charge for import power demand rate. The demand rate is applied to the maximum
         # power draw beyond the threshold within the time horizon.
@@ -665,6 +681,22 @@ class Optimizer:
                     self.problem += (self.variables['cst_dpl_high'][i][t]
                                      >= (prc / (0.2 * bat_capacity))
                                      * (self.variables['s'][i][t] - 0.8 * bat_capacity))
+
+            # reserve comfort while sitting at low SOC (NOT aging - low SOC is gentle): keep a soft
+            # buffer for spontaneous loads / forecast deviation. linear ramp: zero at 20% SOC, full
+            # prc_dpl_soc_low at s_min (the configured floor). Kept small so it only discourages
+            # needless draining and never justifies grid charging to hold the band.
+            if bat.prc_dpl_soc_low > 0:
+                bat_capacity = bat.s_capacity if (bat.s_capacity is not None and bat.s_capacity > 0.0) else bat.s_max
+                bat_capacity = max(bat_capacity, 1.0)
+                low_top = 0.2 * bat_capacity
+                low_width = low_top - bat.s_min
+                if low_width > 0:
+                    for t in self.time_steps:
+                        prc = bat.prc_dpl_soc_low / 3600.0 * self.time_series.dt[t]
+                        self.problem += (self.variables['cst_dpl_low'][i][t]
+                                         >= (prc / low_width)
+                                         * (low_top - self.variables['s'][i][t]))
 
     def solve(self) -> Dict:
         """
