@@ -87,7 +87,6 @@ class BatteryConfig:
     p_demand: Optional[List[float]] = None  # Minimum charge demand (Wh)
     s_goal: Optional[List[float]] = None  # Goal state of charge (Wh)
     c_priority: int = 0
-    withhold_charge: bool = False  # battery can actively pause charging (enables withholding under attenuate_grid_peaks)
     prc_dpl_soc_high: float = 0.0  # price (€/h) for life depletion while sitting above 80% SOC
     prc_dpl_soc_low: float = 0.0  # price (€/h) for reserve comfort while sitting below 20% SOC (soft buffer, not aging)
 
@@ -142,9 +141,6 @@ class Optimizer:
         self.min_import_price = np.min(self.time_series.p_N)
         self.max_import_price = np.max(self.time_series.p_N)
         self.max_export_price = np.max(self.time_series.p_E)
-
-        # peak solar production over the horizon, used to scale the attenuate_grid_peaks strategy
-        self.max_solar = np.max(self.time_series.ft) if len(self.time_series.ft) else 0.0
 
         # scaling base for penalty parameters, derived from the largest real currency/Wh rate
         # any economic term in the model can command, so that the avoidance penalties below
@@ -460,15 +456,8 @@ class Optimizer:
             objective += - pulp.lpSum(self.variables[f'p_{side}_ramp']) * self.prc_p_ramp
 
         # attenuate_grid_peaks additionally smooths the feed-in on top of the horizon/ramp leveling
-        # above, and lets batteries actively withhold charging below the solar peak (evcc relies on
-        # this via BatteryConfig.withhold_charge for the hard export-cap / curtailment case).
+        # above.
         if self.strategy.charging_strategy == 'attenuate_grid_peaks':
-            peak_overshoot_slot = None
-            if self.grid.p_max_exp is not None:
-                for t in self.time_steps:
-                    if self.time_series.ft[t] - self.time_series.gt[t] > self.grid.p_max_exp * self.time_series.dt[t] / 3600.:
-                        peak_overshoot_slot = t
-                        break
             # convex feed-in penalty: increasing marginal cost per segment ((2k+1) approximates the
             # derivative of a quadratic). Minimising it spreads charging into a smooth ramp and
             # flattens the export, instead of the bang-bang block a plain defer term produces.
@@ -477,13 +466,6 @@ class Optimizer:
             for t in self.time_steps:
                 for k in range(self.n_export_segments):
                     objective += - base * (2 * k + 1) * self.variables['e_seg'][t][k]
-            # if the battery hardware can pause charging, actively withhold charging below the solar
-            # peak so capacity stays available to absorb the peak (hard export cap / curtailment case).
-            # Kept above the shaping magnitude so it still governs its slots when enabled.
-            for i, bat in enumerate(self.batteries):
-                for t in self.time_steps:
-                    if bat.withhold_charge and peak_overshoot_slot is not None and t < peak_overshoot_slot:
-                        objective -= self.variables['c'][i][t] * (self.max_solar - self.time_series.ft[t]) * self.min_import_price * 2e-3
 
         # prefer discharging batteries completely before importing from grid
         if self.strategy.discharging_strategy == 'discharge_before_import':

@@ -115,10 +115,6 @@ battery_config_model = api.model('BatteryConfig', {
     'd_max': fields.Float(required=True, description='Maximum discharge power (W)'),
     'p_a': fields.Float(required=True, description='Monetary value per Wh at end of the optimization horizon'),
     'c_priority': fields.Integer(required=False, description='Charging and discharging priority compared to other batteries. 2 = highest priority.'),
-    'withhold_charge': fields.Boolean(
-        required=False,
-        description='Battery can actively pause charging; lets the attenuate_grid_peaks strategy '
-                    'withhold (not just defer) charging below the solar peak to reserve capacity.'),
     'prc_dpl_soc_high': fields.Float(required=False, description='Price (€/h) for higher battery life depletion when sitting above 80% SOC.'),
     'prc_dpl_soc_low': fields.Float(required=False, description='Price (€/h) for reserve comfort when sitting below 20% SOC, ramping to full at s_min (soft buffer to keep the battery off the floor). Default 0 (disabled); the caller sets the value.')
 })
@@ -211,7 +207,6 @@ class OptimizeCharging(Resource):
                     d_max=bat_data['d_max'],
                     p_a=bat_data['p_a'],
                     c_priority=bat_data.get('c_priority', 0),
-                    withhold_charge=bat_data.get('withhold_charge', False),
                     prc_dpl_soc_high=bat_data.get('prc_dpl_soc_high', 0.0),
                     prc_dpl_soc_low=bat_data.get('prc_dpl_soc_low', 0.0),
                 ))

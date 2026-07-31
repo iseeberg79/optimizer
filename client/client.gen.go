@@ -104,12 +104,6 @@ type BatteryConfig struct {
 
 	// SMin Minimum state of charge in Wh
 	SMin float32 `json:"s_min"`
-
-	// WithholdCharge Signals that the battery hardware can actively pause charging (e.g. hold/stop charge).
-	// - True: under the attenuate_grid_peaks strategy the optimizer may withhold charging below the
-	//   solar peak to keep capacity available for peak shaving, accepting cost-neutral surplus export.
-	// - False: (default) the strategy may only re-time (defer) charging, never forgo it.
-	WithholdCharge bool `json:"withhold_charge,omitempty"`
 }
 
 // BatteryResult defines model for BatteryResult.
@@ -232,9 +226,7 @@ type OptimizerStrategy struct {
 	// - charge_before_export: charge batteries before exporting to grid
 	// - attenuate_demand_peaks: level the grid import profile, charging at partial power over several time steps instead of one peak
 	// - attenuate_feedin_peaks: level the grid export profile, charging to shave solar feed-in peaks
-	// - attenuate_grid_peaks: level both the grid import and the grid export profile.
-	//   For batteries with `withhold_charge: true` the strategy may also actively withhold charging
-	//   below the solar peak to keep capacity available for the peak, not just defer it.
+	// - attenuate_grid_peaks: level both the grid import and the grid export profile
 	ChargingStrategy OptimizerStrategyChargingStrategy `json:"charging_strategy,omitempty"`
 
 	// DischargingStrategy Sets a strategy for charging in situations where choices are cost neutral.
@@ -244,13 +236,11 @@ type OptimizerStrategy struct {
 }
 
 // OptimizerStrategyChargingStrategy Sets a strategy for charging in situations where choices are cost neutral.
-//   - none (default): no strategy set
-//   - charge_before_export: charge batteries before exporting to grid
-//   - attenuate_demand_peaks: level the grid import profile, charging at partial power over several time steps instead of one peak
-//   - attenuate_feedin_peaks: level the grid export profile, charging to shave solar feed-in peaks
-//   - attenuate_grid_peaks: level both the grid import and the grid export profile.
-//     For batteries with `withhold_charge: true` the strategy may also actively withhold charging
-//     below the solar peak to keep capacity available for the peak, not just defer it.
+// - none (default): no strategy set
+// - charge_before_export: charge batteries before exporting to grid
+// - attenuate_demand_peaks: level the grid import profile, charging at partial power over several time steps instead of one peak
+// - attenuate_feedin_peaks: level the grid export profile, charging to shave solar feed-in peaks
+// - attenuate_grid_peaks: level both the grid import and the grid export profile
 type OptimizerStrategyChargingStrategy string
 
 // OptimizerStrategyDischargingStrategy Sets a strategy for charging in situations where choices are cost neutral.
