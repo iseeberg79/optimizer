@@ -75,7 +75,7 @@ def test_battery_first_inactive_by_default():
     assert battery.battery_first is False
 
 
-def _solve_short_first_slot(dt0, battery_first, n_slots=8):
+def _solve_short_first_slot(dt0, battery_first, strategy='none', n_slots=8):
     """
     Mirrors evcc's real request shape: dt[0] is the short remainder of the ongoing 15-min slot
     (shrinks toward 0 as the ~2-minute update loop re-solves within the same quarter-hour),
@@ -96,7 +96,7 @@ def _solve_short_first_slot(dt0, battery_first, n_slots=8):
         c_min=0, c_max=6000, d_max=0, p_a=0.35, battery_first=battery_first,
     )
     time_series = TimeSeriesData(dt=dt, gt=[0] * n, ft=[0] * n, p_N=[0.30] * n, p_E=[0.10] * n)
-    return Optimizer(OptimizationStrategy('none', 'none'), grid, [battery], time_series, eta_c=1.0, eta_d=1.0).solve()
+    return Optimizer(OptimizationStrategy(strategy, 'none'), grid, [battery], time_series, eta_c=1.0, eta_d=1.0).solve()
 
 
 def test_battery_first_keeps_short_first_slot_at_full_power():
@@ -110,6 +110,11 @@ def test_battery_first_keeps_short_first_slot_at_full_power():
     available rate throughout the slot's whole lifetime - reproducing the repeated re-solves
     (~every 2 minutes) that happen in real operation as dt[0] shrinks from a full slot down to
     a few seconds before the wall-clock quarter-hour boundary is crossed.
+
+    Uses charging_strategy='none' deliberately, isolating battery_first's own tie-break from
+    any interaction with a peak-levelling strategy - see
+    test_battery_first_is_a_noop_under_symmetric_attenuate_grid_peaks below for why the actually
+    deployed strategy (attenuate_grid_peaks) needs no separate coverage of this same scenario.
     """
     for dt0 in (900, 780, 540, 300, 60, 5):
         result = _solve_short_first_slot(dt0, battery_first=True)
@@ -128,3 +133,31 @@ def test_battery_first_off_still_defers_short_first_slot():
     result = _solve_short_first_slot(120, battery_first=False)
     assert result['status'] == 'Optimal'
     assert np.isclose(result['batteries'][0]['charging_power'][0], 0, atol=1.0)
+
+
+def test_battery_first_is_a_noop_under_symmetric_attenuate_grid_peaks():
+    """
+    evcc's actually configured optimizerChargingStrategy is attenuate_grid_peaks (confirmed via
+    the deployed instance's settings DB), not 'none' - the two tests above intentionally don't
+    cover it. Under a symmetric, flat-price/flat-load scenario like this one,
+    attenuate_grid_peaks' ramp-levelling penalty (prc_p_ramp) already forces the unique
+    optimum to spread charging evenly across every available slot - there is no residual tie
+    left for battery_first to resolve, so it must produce byte-identical schedules whether on
+    or off. This does not mean battery_first is redundant in general - a real, asymmetric PV/
+    price/load shape (see the production trace this was validated against) still leaves genuine
+    ties for it to break - only that the short-first-slot degeneracy the two tests above guard
+    against cannot recur under this strategy for a symmetric input, because levelling alone
+    already prevents it.
+    """
+    for dt0 in (900, 300, 60, 5):
+        with_bf = _solve_short_first_slot(dt0, battery_first=True, strategy='attenuate_grid_peaks')
+        without_bf = _solve_short_first_slot(dt0, battery_first=False, strategy='attenuate_grid_peaks')
+
+        assert with_bf['status'] == without_bf['status'] == 'Optimal'
+        assert np.allclose(with_bf['batteries'][0]['charging_power'],
+                            without_bf['batteries'][0]['charging_power'], atol=1e-3)
+
+        # and, unlike the 'none' case, the first slot is never left at 0 regardless of
+        # battery_first - levelling alone spreads the charge across the whole window
+        energy0 = with_bf['batteries'][0]['charging_power'][0]
+        assert energy0 > 0, f"dt0={dt0}s: slot 0 should not be starved of charge under levelling"
