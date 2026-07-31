@@ -73,3 +73,58 @@ def test_battery_first_inactive_by_default():
         c_min=0, c_max=5000, d_max=0, p_a=0.30,
     )
     assert battery.battery_first is False
+
+
+def _solve_short_first_slot(dt0, battery_first, n_slots=8):
+    """
+    Mirrors evcc's real request shape: dt[0] is the short remainder of the ongoing 15-min slot
+    (shrinks toward 0 as the ~2-minute update loop re-solves within the same quarter-hour),
+    dt[1:] are full 900s slots, all at the same flat price. s_capacity (3000 Wh) needs at least
+    two slots at full c_max (6000 W * 900s = 1500 Wh each) to fill, but the flat window offers
+    more slots than that (8), leaving genuine slack in *which* of the equally-cheap slots get
+    used at max power - that slack is exactly what battery_first is meant to resolve in favour
+    of the earliest ones. p_a (0.35) sits above p_N (0.30), so charging fully is worthwhile, but
+    nothing distinguishes *when* within the flat window - without that gap, charging would never
+    be profitable regardless of dt0 or battery_first, making the test vacuous.
+    """
+    grid = GridConfig(p_max_imp=None, p_max_exp=None, prc_p_exc_imp=None)
+    dt = [dt0] + [900] * (n_slots - 1)
+    n = len(dt)
+    battery = BatteryConfig(
+        charge_from_grid=True, discharge_to_grid=False,
+        s_capacity=3000, s_min=0, s_max=3000, s_initial=0,
+        c_min=0, c_max=6000, d_max=0, p_a=0.35, battery_first=battery_first,
+    )
+    time_series = TimeSeriesData(dt=dt, gt=[0] * n, ft=[0] * n, p_N=[0.30] * n, p_E=[0.10] * n)
+    return Optimizer(OptimizationStrategy('none', 'none'), grid, [battery], time_series, eta_c=1.0, eta_d=1.0).solve()
+
+
+def test_battery_first_keeps_short_first_slot_at_full_power():
+    """
+    evcc's core/site_optimizer.go used to read the charge intent from ChargingPower[1] instead
+    of [0] because the first slot's charge was unreliable (see evcc-io/optimizer companion
+    fork commit 8a69a797e): under a locally flat price, the solver could arbitrarily defer all
+    charging past the short first slot into a later, full-length one. That workaround has been
+    reverted in favour of battery_first, which must therefore keep the first slot's charge
+    *power* (not just its energy, which necessarily shrinks with a shorter slot) at the full
+    available rate throughout the slot's whole lifetime - reproducing the repeated re-solves
+    (~every 2 minutes) that happen in real operation as dt[0] shrinks from a full slot down to
+    a few seconds before the wall-clock quarter-hour boundary is crossed.
+    """
+    for dt0 in (900, 780, 540, 300, 60, 5):
+        result = _solve_short_first_slot(dt0, battery_first=True)
+        assert result['status'] == 'Optimal'
+
+        energy0 = result['batteries'][0]['charging_power'][0]
+        power0 = energy0 / (dt0 / 3600)
+        assert np.isclose(power0, 6000, atol=1.0), (
+            f"dt0={dt0}s: slot 0 should charge at the full available rate, got {power0:.1f} W"
+        )
+
+
+def test_battery_first_off_still_defers_short_first_slot():
+    """Without battery_first, the degeneracy this feature fixes is still present - guards
+    against the fix above becoming vacuous if something else started masking it."""
+    result = _solve_short_first_slot(120, battery_first=False)
+    assert result['status'] == 'Optimal'
+    assert np.isclose(result['batteries'][0]['charging_power'][0], 0, atol=1.0)
