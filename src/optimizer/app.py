@@ -116,7 +116,8 @@ battery_config_model = api.model('BatteryConfig', {
     'p_a': fields.Float(required=True, description='Monetary value per Wh at end of the optimization horizon'),
     'c_priority': fields.Integer(required=False, description='Charging and discharging priority compared to other batteries. 2 = highest priority.'),
     'prc_dpl_soc_high': fields.Float(required=False, description='Price (€/h) for higher battery life depletion when sitting above 80% SOC.'),
-    'prc_dpl_soc_low': fields.Float(required=False, description='Price (€/h) for reserve comfort when sitting below 20% SOC, ramping to full at s_min (soft buffer to keep the battery off the floor). Default 0 (disabled); the caller sets the value.')
+    'prc_dpl_soc_low': fields.Float(required=False, description='Price (€/h) for reserve comfort when sitting below 20% SOC, ramping to full at s_min (soft buffer to keep the battery off the floor). Default 0 (disabled); the caller sets the value.'),
+    'battery_first': fields.Boolean(required=False, description='Tie-break, independent of charging_strategy: prefer charging this battery as early as possible whenever it is otherwise cost-neutral. Default false.')
 })
 
 time_series_model = api.model('TimeSeries', {
@@ -209,6 +210,7 @@ class OptimizeCharging(Resource):
                     c_priority=bat_data.get('c_priority', 0),
                     prc_dpl_soc_high=bat_data.get('prc_dpl_soc_high', 0.0),
                     prc_dpl_soc_low=bat_data.get('prc_dpl_soc_low', 0.0),
+                    battery_first=bat_data.get('battery_first', False),
                 ))
 
             # Parse time series data

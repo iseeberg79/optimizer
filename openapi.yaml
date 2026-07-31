@@ -287,6 +287,14 @@ components:
             deviation. A linear cost model is applied, starting at 20% SOC, applying full price at
             s_min. Kept small so it never justifies grid charging to hold the band.
             Default 0 (disabled); the caller sets the value. Capacity is s_capacity or s_max.
+        battery_first:
+          type: boolean
+          default: false
+          description: |
+            Tie-break, independent of charging_strategy: prefer charging this battery as early
+            as possible whenever it is otherwise cost-neutral. Real costs (price arbitrage,
+            prc_dpl_soc_high/low) always dominate this preference, so it only resolves ties
+            the strategy/economics leave open.
 
     TimeSeries:
       type: object
