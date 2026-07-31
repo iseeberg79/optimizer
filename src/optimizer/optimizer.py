@@ -14,6 +14,57 @@ class OptimizationStrategy:
     discharging_strategy: str
 
 
+# charging strategies that level grid peaks, mapped to the metered sides they level.
+# 'imp' is the demand side (grid import), 'exp' the feed-in side (grid export).
+PEAK_STRATEGY_SIDES = {
+    'attenuate_demand_peaks': ('imp',),
+    'attenuate_feedin_peaks': ('exp',),
+    'attenuate_grid_peaks': ('imp', 'exp'),
+}
+
+# magnitude the largest objective coefficient is placed at before the model goes to the solver.
+# CBC judges improvements against absolute tolerances (~1e-7), and with prices given per Wh the
+# raw coefficients land close to that bound, so real improvements get pruned as numerical noise.
+# Scaling does not change the argmax, it only moves the window. The reported objective value is
+# recalculated from the solution and stays in its original unit.
+OBJECTIVE_TARGET = 1e6
+
+# fixed factor to use instead of deriving one from the coefficients. None derives it, which is the
+# production setting; the tests pin it to compare two scalings of the same model.
+OBJECTIVE_SCALE = None
+
+
+def objective_scale(objective) -> float:
+    """
+    Factor that puts the largest objective coefficient at OBJECTIVE_TARGET.
+
+    Derived from the coefficients rather than fixed, because their magnitude is set by the request:
+    prices per Wh, a demand rate per W, the penalty base they scale from. Across the stored cases
+    the largest coefficient moves by three orders, from 1.6e-1 where market prices go negative to
+    3e2 on the peak levelling ones, so a single constant lands the same model anywhere in that
+    range and a fixed 1e6 pushes six of nineteen past 1e6 in the model handed to the solver.
+
+    Anchored on the largest coefficient and not on the smallest: the smallest is a strategy tie
+    breaker, deliberately tiny, and aiming that one at a floor drags the whole objective down with
+    it. Measured, that costs 3 requests of 335 their solution and runs others three times past the
+    time limit, because the objective ends up orders below a constraint matrix that carries a big M
+    of 1e6. The span within a model is up to 1e8 and no single factor can fix that, only the model.
+    """
+    if OBJECTIVE_SCALE is not None:
+        return OBJECTIVE_SCALE
+    coefficients = [abs(c) for c in pulp.LpAffineExpression(objective).values() if c]
+    if not coefficients:
+        return 1.0
+    return OBJECTIVE_TARGET / max(coefficients)
+
+
+# grid energy variable and limit exceedance variable per leveled side
+PEAK_SIDE_VARIABLES = {
+    'imp': ('n', 'e_imp_lim_exc'),
+    'exp': ('e', 'e_exp_lim_exc'),
+}
+
+
 @dataclass
 class GridConfig:
     p_max_imp: float
@@ -77,37 +128,61 @@ class Optimizer:
         self.time_steps = range(self.T)
         # the optimization problem
         self.problem = None
+        # factor the objective went to the solver with, set by _setup_target_function
+        self.objective_scale = None
         # dictionary of optimizer variables
         self.variables = {}
+
+        # with a demand rate given, the grid import limit is the threshold beyond which the rate
+        # applies. Needed by the penalty scaling below as well as by the constraints and objective.
+        self.is_grid_demand_rate_active = (self.grid.p_max_imp is not None
+                                           and self.grid.prc_p_exc_imp is not None)
 
         # Compute scaling for strategy control parameters
         self.min_import_price = np.min(self.time_series.p_N)
         self.max_import_price = np.max(self.time_series.p_N)
+        self.max_export_price = np.max(self.time_series.p_E)
 
         # peak solar production over the horizon, used to scale the attenuate_grid_peaks strategy
         self.max_solar = np.max(self.time_series.ft) if len(self.time_series.ft) else 0.0
 
-        # scaling base for penalty parameters. Make sure goal_penalty is always positive.
-        penalty_base = np.max([self.max_import_price, 0.1e-3])
+        # scaling base for penalty parameters, derived from the largest real currency/Wh rate
+        # any economic term in the model can command, so that the avoidance penalties below
+        # (which are all multiples of penalty_base applied to Wh-denominated violations) stay
+        # above real cost trade-offs regardless of the price data. Make sure it's always positive.
+        real_prices_per_wh = [
+            self.max_import_price,
+            self.max_export_price,
+            *(bat.p_a for bat in self.batteries),
+        ]
+        if self.is_grid_demand_rate_active:
+            # prc_p_exc_imp is currency/W and the charge is set by the single worst time step, so
+            # 1 Wh kept out of the binding step is worth 3600/dt[t] W of it. Converting over the
+            # shortest step keeps the penalties above that incentive everywhere, converting over the
+            # horizon does not: a violation confined to one short step would outweigh them.
+            real_prices_per_wh.append(self.grid.prc_p_exc_imp * 3600. / min(self.time_series.dt))
+        self.penalty_base = np.max(real_prices_per_wh + [0.1e-3])
 
         # scaling for penalty parameters
-        self.prc_e_goal_pen = penalty_base * 10e1
-        self.prc_p_goal_pen = penalty_base * np.max(self.time_series.dt) / 3600 * 10e1
-        self.prc_soc_exc_pen = penalty_base * 10e2
+        self.prc_e_goal_pen = self.penalty_base * 10e1
+        self.prc_p_goal_pen = self.penalty_base * 10e1
+        self.prc_soc_exc_pen = self.penalty_base * 10e2
 
         # penalty for exceeding grid import limit. Result shall not become infeasible but report the violation
         # with helpful information
-        self.prc_e_grid_imp_pen = penalty_base * 10e1
+        self.prc_e_grid_imp_pen = self.penalty_base * 10e1
         # penalty for exceeding the grid export limit. Result shall not become infeasible but report the 'lost'
         # solar power
-        self.prc_e_grid_exp_pen = penalty_base * 10e1
+        self.prc_e_grid_exp_pen = self.penalty_base * 10e1
 
-        # if there is a demand rate given in the input, the grid import limit will be interpreted as the
-        # threshold beyond wich the demand rate is to be applied. Compute a demand rate flag for use in the
-        # build constraint and build objective methods.
-        self.is_grid_demand_rate_active = False
-        if self.grid.p_max_imp is not None and self.grid.prc_p_exc_imp is not None:
-            self.is_grid_demand_rate_active = True
+        # weights of the grid peak leveling strategies. capping the horizon maximum alone leaves the
+        # profile below the cap arbitrary, so the step to step ramp is penalized as well. The ramp
+        # weight is the smaller one, so lowering the peak wins wherever the two disagree.
+        self.prc_p_peak = self.penalty_base * 1e-3
+        self.prc_p_ramp = self.penalty_base * 1e-5
+
+        # grid sides leveled by the active peak attenuation strategy, empty for all other strategies
+        self.peak_sides = PEAK_STRATEGY_SIDES.get(strategy.charging_strategy, ())
 
         # feed-in peak shaping is part of the attenuate_grid_peaks strategy: a convex penalty on
         # the feed-in power spreads/flattens the export so the battery charges as a smooth ramp
@@ -173,11 +248,14 @@ class Optimizer:
         self.variables['p_demand_pen'] = [[None for t in self.time_steps] for i in range(len(self.batteries))]
         # binary variable to allow one out of two alternative constraints
         self.variables['z_p_demand'] = [[None for t in self.time_steps] for i in range(len(self.batteries))]
+        # binary variable to capture when s_max is reached
+        self.variables['z_s_max_reached'] = [[None for t in self.time_steps] for i in range(len(self.batteries))]
         for i, bat in enumerate(self.batteries):
             if bat.p_demand is not None:
                 for t in self.time_steps:
                     self.variables['p_demand_pen'][i][t] = pulp.LpVariable(f"p_demand_pen_{i}_{t}", lowBound=0)
                     self.variables['z_p_demand'][i][t] = pulp.LpVariable(f"z_p_demand_{i}_{t}", cat='Binary')
+                    self.variables['z_s_max_reached'][i][t] = pulp.LpVariable(f"z_s_max_reached_{i}_{t}", cat='Binary')
 
         # penalty variable for staying above max SOC and below min SOC
         self.variables['s_max_pen'] = [[pulp.LpVariable(f"s_max_pen_{i}_{t}", lowBound=0) for t in self.time_steps] for i in range(len(self.batteries))]
@@ -217,6 +295,16 @@ class Optimizer:
         # within the time horizon (W)
         if self.is_grid_demand_rate_active:
             self.variables['p_max_imp_exc'] = pulp.LpVariable("p_max_imp_exc", lowBound=0)
+
+        # highest grid power over the whole horizon (W) and step to step ramp of the grid power (W)
+        # per side, used by the peak attenuation strategies. there is no ramp into the first time
+        # step, so the ramp of step t is held at index t - 1
+        for side in self.peak_sides:
+            self.variables[f'p_{side}_peak'] = pulp.LpVariable(f"p_{side}_peak", lowBound=0)
+            self.variables[f'p_{side}_ramp'] = [
+                pulp.LpVariable(f"p_{side}_ramp_{t}", lowBound=0)
+                for t in range(1, self.T)
+            ]
 
         # Binary variable: power flow direction to / from grid variables
         # these variables
@@ -360,7 +448,20 @@ class Optimizer:
                 for t in self.time_steps:
                     objective += - self.variables['e'][t] * self.min_import_price * 2e-5 * (self.T - t)
 
-        # attenuate the public grid load at the midday peak
+        # level the grid profile to unload the public grid from peaks. attenuate_demand_peaks levels
+        # grid import, attenuate_feedin_peaks levels grid export, attenuate_grid_peaks levels both.
+        # the penalty sits on the horizon maximum and on the step to step ramp instead of on charge
+        # power, so the optimizer spreads charging at partial power over several time steps rather
+        # than running one step at full power, and keeps the profile below the cap leveled too.
+        # penalty_base is used instead of min_import_price because negative market prices would turn
+        # this penalty into a reward for peaks.
+        for side in self.peak_sides:
+            objective += - self.variables[f'p_{side}_peak'] * self.prc_p_peak
+            objective += - pulp.lpSum(self.variables[f'p_{side}_ramp']) * self.prc_p_ramp
+
+        # attenuate_grid_peaks additionally smooths the feed-in on top of the horizon/ramp leveling
+        # above, and lets batteries actively withhold charging below the solar peak (evcc relies on
+        # this via BatteryConfig.withhold_charge for the hard export-cap / curtailment case).
         if self.strategy.charging_strategy == 'attenuate_grid_peaks':
             peak_overshoot_slot = None
             if self.grid.p_max_exp is not None:
@@ -396,7 +497,8 @@ class Optimizer:
                 objective += self.variables['c'][i][t] * self.min_import_price * 5e-5 * (self.T - t) * bat.c_priority
                 objective += self.variables['d'][i][t] * self.min_import_price * 5e-5 * (self.T - t) * bat.c_priority
 
-        self.problem += objective
+        self.objective_scale = objective_scale(objective)
+        self.problem += objective * self.objective_scale
 
     def _add_energy_balance_constraints(self):
         """
@@ -440,12 +542,22 @@ class Optimizer:
                              == e_grid_exp
                              + self.time_series.gt[t])
 
-        # Constraints (4)-(5): Grid flow direction
+        # Constraints (4)-(5): Grid flow direction. Export/import have natural
+        # per-step caps (export: solar plus discharge-to-grid capacity; import:
+        # demand plus grid-charge capacity) that tighten the LP relaxation vs
+        # the global big-M without excluding any integer point. When a grid
+        # limit is active, the opposite side's unbounded excess variable enters
+        # the energy balance, so only then fall back to the global big-M.
+        cap_d_exp = sum(b.d_max for b in self.batteries if b.discharge_to_grid)
+        cap_c_imp = sum(b.c_max for b in self.batteries if b.charge_from_grid)
         for t in self.time_steps:
+            dth = self.time_series.dt[t] / 3600.
+            m_exp = self.time_series.ft[t] + cap_d_exp * dth if self.grid.p_max_imp is None else self.M
+            m_imp = self.time_series.gt[t] + cap_c_imp * dth if self.grid.p_max_exp is None else self.M
             # Export constraint
-            self.problem += self.variables['e'][t] <= self.M * self.variables['y'][t]
+            self.problem += self.variables['e'][t] <= m_exp * self.variables['y'][t]
             # Import constraint
-            self.problem += self.variables['n'][t] <= self.M * (1 - self.variables['y'][t])
+            self.problem += self.variables['n'][t] <= m_imp * (1 - self.variables['y'][t])
 
         # limit regular grid import power
         if self.grid.p_max_imp is not None:
@@ -454,7 +566,8 @@ class Optimizer:
                 for t in self.time_steps:
                     self.problem += self.variables['n'][t] <= self.grid.p_max_imp * self.time_series.dt[t] / 3600
                     self.problem += (self.grid.p_max_imp * self.time_series.dt[t] / 3600 - self.variables['n'][t]
-                                     <= self.M * self.variables['z_imp_lim'][t])
+                                     <= self.grid.p_max_imp * self.time_series.dt[t] / 3600
+                                     * self.variables['z_imp_lim'][t])
                     self.problem += (self.variables['e_imp_lim_exc'][t]
                                      <= self.M * (1 - self.variables['z_imp_lim'][t]))
             else:
@@ -462,7 +575,8 @@ class Optimizer:
                 for t in self.time_steps:
                     self.problem += self.variables['n'][t] <= self.grid.p_max_imp * self.time_series.dt[t] / 3600
                     self.problem += (self.grid.p_max_imp * self.time_series.dt[t] / 3600 - self.variables['n'][t]
-                                     <= self.M * self.variables['z_imp_lim'][t])
+                                     <= self.grid.p_max_imp * self.time_series.dt[t] / 3600
+                                     * self.variables['z_imp_lim'][t])
                     self.problem += (self.variables['e_imp_lim_exc'][t]
                                      <= self.M * (1 - self.variables['z_imp_lim'][t]))
 
@@ -471,9 +585,30 @@ class Optimizer:
             for t in self.time_steps:
                 self.problem += self.variables['e'][t] <= self.grid.p_max_exp * self.time_series.dt[t] / 3600
                 self.problem += (self.grid.p_max_exp * self.time_series.dt[t] / 3600 - self.variables['e'][t]
-                                 <= self.M * self.variables['z_exp_lim'][t])
+                                 <= self.grid.p_max_exp * self.time_series.dt[t] / 3600
+                                 * self.variables['z_exp_lim'][t])
                 self.problem += (self.variables['e_exp_lim_exc'][t]
                                  <= self.M * (1 - self.variables['z_exp_lim'][t]))
+
+        # track the horizon maximum and the step to step ramp of the total grid power for every side
+        # the strategy levels. Both include the portion beyond p_max_imp / p_max_exp, so they stay
+        # correct in demand rate mode and when a limit is violated.
+        for side in self.peak_sides:
+            grid_var, lim_exc_var = PEAK_SIDE_VARIABLES[side]
+            # total grid power of this side per time step (W)
+            p_grid = []
+            for t in self.time_steps:
+                e_grid = self.variables[grid_var][t]
+                if lim_exc_var in self.variables:
+                    e_grid = e_grid + self.variables[lim_exc_var][t]
+                p_grid.append(e_grid * 3600 / self.time_series.dt[t])
+
+            for t in self.time_steps:
+                self.problem += p_grid[t] <= self.variables[f'p_{side}_peak']
+            # ramp magnitude: p_ramp[t - 1] >= |p_grid[t] - p_grid[t-1]|
+            for t in range(1, self.T):
+                self.problem += self.variables[f'p_{side}_ramp'][t - 1] >= p_grid[t] - p_grid[t - 1]
+                self.problem += self.variables[f'p_{side}_ramp'][t - 1] >= p_grid[t - 1] - p_grid[t]
 
         # if demand rate is applied, the maximum grid import power value
         # of all time steps drives the demand rate charge
@@ -527,48 +662,65 @@ class Optimizer:
             if bat.p_demand is not None:
                 for t in self.time_steps:
                     if bat.p_demand[t] > 0:
-                        # clip required charge to max charging power if needed
-                        # and leave some air to breathe for the optimizer
+                        # clip requested charging power to max charging power if needed
                         p_demand = min(bat.c_max * self.time_series.dt[t] / 3600., bat.p_demand[t])
-                        # two alternative constraints, only one is active:
-                        # constraint option 1: charge energy tries to reach min charge energy parameter
-                        self.problem += (self.variables['c'][i][t] + self.variables['p_demand_pen'][i][t]
-                                         + self.M * self.variables['z_p_demand'][i][t] >= p_demand)
-                        # constraint option 2: charge energy tries to reach energy to fill the battery to s_max
-                        self.problem += (self.variables['c'][i][t] + self.variables['p_demand_pen'][i][t]
-                                         + self.M * (1 - self.variables['z_p_demand'][i][t])
-                                         - (self.batteries[i].s_max - self.variables['s'][i][t]) >= 0.)
-                    elif bat.c_min > 0:
-                        # in time steps without given charging demand, apply normal lower bound:
-                        # Lower bound: either 0 or at least c_min
-                        self.problem += (self.variables['c'][i][t] >= bat.c_min * self.time_series.dt[t] / 3600.
-                                         * self.variables['z_c'][i][t])
-                        self.problem += (self.variables['c'][i][t] <= self.M * self.variables['z_c'][i][t])
 
-            # Constraint (7): Minimum charge power limits if there is not charge demand
+                        # introduce z_p_demand to become only 1 if s_max is almost reached and the
+                        # charging with c_min would stop before the end of the time slot
+                        # s is bounded below by 0, so s_max is the largest the left side can get
+                        self.problem += ((bat.s_max - self.variables['s'][i][t])
+                                         <= (1 - self.variables['z_p_demand'][i][t]) * bat.s_max
+                                         + bat.c_min * self.time_series.dt[t] / 3600.)
+
+                        # introduce z_s_max_reached to become only 1 if s_max is fully reached
+                        self.problem += ((bat.s_max - self.variables['s'][i][t])
+                                         <= (1 - self.variables['z_s_max_reached'][i][t]) * bat.s_max)
+
+                        # set a "soft" constraint to reach the requested charging rate if possible.
+                        # deactivate it if s_max is already reached
+                        self.problem += (self.variables['c'][i][t] + self.variables['p_demand_pen'][i][t]
+                                         >= (1 - self.variables['z_s_max_reached'][i][t]) * p_demand)
+                    else:
+                        # if there is no p_demand set, make sure z_p_demand is 0 to keep the below c_min constraint effective
+                        self.problem += (self.variables['z_p_demand'][i][t] <= 0)
+
+                    if bat.c_min > 0:
+                        # set constraints to exclude charging between 0 and c_min if z_p_demand is not 1.
+                        self.problem += (self.variables['c'][i][t]
+                                         + bat.c_min * self.time_series.dt[t] / 3600. * self.variables['z_p_demand'][i][t]
+                                         >= bat.c_min * self.time_series.dt[t] / 3600. * self.variables['z_c'][i][t])
+                        self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
+                                         * self.variables['z_c'][i][t])
+
+            # Constraint (7): Minimum charge power limits if there is no charge demand
             elif bat.c_min > 0:
                 for t in self.time_steps:
                     # Lower bound: either 0 or at least c_min
                     self.problem += (self.variables['c'][i][t] >= bat.c_min * self.time_series.dt[t] / 3600.
                                      * self.variables['z_c'][i][t])
-                    self.problem += (self.variables['c'][i][t] <= self.M * self.variables['z_c'][i][t])
+                    self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
+                                     * self.variables['z_c'][i][t])
 
             # control battery charging from grid
             if not bat.charge_from_grid:
                 for t in self.time_steps:
-                    self.problem += (self.variables['c'][i][t] <= self.M * self.variables['y'][t])
+                    self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
+                                     * self.variables['y'][t])
 
             # control battery discharging to grid
             if not bat.discharge_to_grid:
                 for t in self.time_steps:
-                    self.problem += (self.variables['d'][i][t] <= self.M * (1 - self.variables['y'][t]))
+                    self.problem += (self.variables['d'][i][t] <= bat.d_max * self.time_series.dt[t] / 3600.
+                                     * (1 - self.variables['y'][t]))
 
             # lock charging against discharging
             for t in self.time_steps:
                 # Discharge constraint
-                self.problem += self.variables['d'][i][t] <= self.M * self.variables['z_cd'][i][t]
+                self.problem += (self.variables['d'][i][t] <= bat.d_max * self.time_series.dt[t] / 3600.
+                                 * self.variables['z_cd'][i][t])
                 # Charge constraint
-                self.problem += self.variables['c'][i][t] <= self.M * (1 - self.variables['z_cd'][i][t])
+                self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
+                                 * (1 - self.variables['z_cd'][i][t]))
 
             # cost for depleting battery life by sitting at very high SOC (calendar aging).
             # linear ramp: zero at 80% SOC, full prc_dpl_soc_high at 100% SOC.
@@ -618,8 +770,17 @@ class Optimizer:
             solver.tmpDir = tmpdir
             self.problem.solve(solver)
 
-        # Extract results
+        # Extract results.
+        #
+        # pulp reports LpStatusOptimal whenever CBC came back with any feasible solution, including
+        # one it stopped on at the time limit, so status alone cannot tell a proved schedule from a
+        # truncated one. Measured on a captured request, a 2 s run and a 30 s run both said Optimal
+        # with objective values of -682466848 and 59714881. sol_status carries the distinction and
+        # is folded into the reported status here rather than exposed as a second field: callers
+        # already branch on this one, and 'Optimal' claiming more than it can back is the bug.
         status = pulp.LpStatus[self.problem.status]
+        if status == 'Optimal' and self.problem.sol_status != pulp.LpSolutionOptimal:
+            status = 'Feasible'
 
         # grid import and export if no demand rate is active
         # if a limit is set and exceeded, this is the part that is actually imported / exported.
@@ -645,7 +806,9 @@ class Optimizer:
             grid_exp_limit_hit = (np.max([pulp.value(var) for var in self.variables['e_exp_lim_exc']]) > 0)
             e_grid_exp_overshoot = [pulp.value(var) for var in self.variables['e_exp_lim_exc']]
 
-        if status == 'Optimal':
+        # a Feasible solve carries a full schedule, it just is not proved, so it is returned like
+        # an optimal one. Only the label changes.
+        if status in ('Optimal', 'Feasible'):
             result = {
                 'status': status,
                 'objective_value': self.get_clean_objective_value(),

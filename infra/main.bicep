@@ -81,16 +81,33 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
         {
           name: 'optimizer'
           image: containerImage
+          // one vCPU per replica keeps allocation close to demand. The solve is CPU bound,
+          // so a coarser replica rounds up into cores that are paid for and never used.
           resources: {
-            cpu: json('2')
-            memory: '4Gi'
+            cpu: json('1')
+            memory: '2Gi'
           }
           env: [
-            { name: 'OPTIMIZER_TIME_LIMIT', value: '20' }
+            // requests that reach the limit walk a cost optimal plateau rather than close a gap:
+            // replaying 20 collected ones, 17 end on the same objective at 10 s as at 20 s. The
+            // exception cost 4.7 percent, so this halves the latency and the core they hold on a
+            // one vCPU replica at the price of a worse schedule for a small share of them.
+            { name: 'OPTIMIZER_TIME_LIMIT', value: '10' }
             { name: 'OPTIMIZER_NUM_THREADS', value: '1' }
+            // the dump threshold is the time limit, so this collects everything above 10 s now.
+            // The file is ephemeral, a replica restart takes it with it.
+            { name: 'OPTIMIZER_DUMP_SLOW_REQUESTS', value: '/tmp/slow-requests.jsonl' }
             {
               name: 'GUNICORN_CMD_ARGS'
-              value: '--workers 8 --timeout 40 --max-requests 100 --max-requests-jitter 500'
+              // one worker per vCPU, and the replica carries one. Two workers on one core let
+              // a pair of concurrent solves halve each other's speed, which pushed a 20 s solve
+              // past the request timeout and cost a worker, and with it a core, for good.
+              // the timeout sits above the worst elapsed time seen in production, 29 s, so it
+              // catches a genuinely stuck request without cutting a legitimate solve short.
+              // the config module reaps a solver that outlived its worker anyway.
+              // the access log is the only source of per request latency. %(D)s is the
+              // response time in microseconds, the rest of the format stays lean on purpose.
+              value: '--workers 1 --timeout 60 --max-requests 100 --max-requests-jitter 500 --config python:optimizer.gunicorn_conf --access-logfile - --access-logformat \'%(m)s %(U)s %(s)s %(D)s\''
             }
             { name: 'JWT_TOKEN_SECRET', secretRef: 'jwt-token-secret' }
           ]
@@ -109,12 +126,24 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
       scale: {
         minReplicas: 1
         maxReplicas: 50
+        // KEDA takes the maximum over both rules. The CPU rule is the one that matches the
+        // bottleneck, the concurrency rule stays as a fast reacting guard for bursts.
         rules: [
           {
             name: 'http-scaling'
             http: {
               metadata: {
-                concurrentRequests: '16'
+                concurrentRequests: '8'
+              }
+            }
+          }
+          {
+            name: 'cpu-scaling'
+            custom: {
+              type: 'cpu'
+              metadata: {
+                type: 'Utilization'
+                value: '75'
               }
             }
           }

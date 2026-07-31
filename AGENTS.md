@@ -39,6 +39,9 @@ The model is a maximization problem. Read these before changing it:
 - Charging and discharging strategies are cost-neutral tie-breakers. They add tiny soft terms (coefficient around `min_import_price * 1e-6`) that only decide between economically equal solutions. They are intentionally excluded from `get_clean_objective_value()`, which recomputes the real economic value without strategy incentives or penalties.
 - `get_clean_objective_value()` measures battery value as `(s[T-1] - s[0]) * p_a`, but `s[0]` already includes the first time step's charging, so energy charged in the first step is not counted as a gain. The optimization objective itself uses the absolute final state of charge, `s[-1] * p_a`. Two solutions that are equal in the real objective can therefore report different clean values. Keep optional charging off the first time step when designing cost-neutrality scenarios.
 - Grid limits are soft: exceeding `p_max_imp` or `p_max_exp` is penalized rather than forbidden, so an over constrained request reports the violation instead of returning infeasible.
+- Never read `problem.status` to mean "the solver finished". pulp sets `LpStatusOptimal` whenever CBC returned any feasible solution, including one it stopped on at the time limit: on one captured request a 2 s and a 30 s run both reported Optimal, with objective values of -682466848 and 59714881. `problem.sol_status == LpSolutionOptimal` is the only thing that means proved. `solve()` folds the two into the reported status, `Optimal` against `Feasible`.
+- CBC's `-sec` is not a wall clock on the request. It is only tested between branch and bound nodes, so a model that finishes in presolve or the root relaxation ignores it entirely: every stored case still proves itself at a limit of 0.01 s, and `020-weird-charging-at-night` takes 0.98 s regardless. Do not write tests that expect a small time limit to truncate a solve.
+- The assembled objective is scaled before it goes to the solver. Prices per Wh put the raw coefficients close to CBC's absolute tolerances, where real improvements are discarded as numerical noise. The factor is derived per model by `objective_scale()`, which puts the largest coefficient at `OBJECTIVE_TARGET`; `OBJECTIVE_SCALE` overrides it with a fixed factor and exists for the tests. Anchor on the largest coefficient, never on the smallest: the smallest is a strategy tie breaker and is deliberately tiny, so aiming it at a floor drags the objective below the constraint matrix and costs solutions. Scaling does not change the argmax. Keep new objective terms in the same unit and let the scaling do its work, do not compensate for it in individual coefficients.
 
 ## Python Coding Standards
 
@@ -56,7 +59,8 @@ The model is a maximization problem. Read these before changing it:
 
 - The suite runs with `uv run pytest`.
 - `test_cases/*.json` are loaded by `tests/test_app.py`. Each file holds a `request` and an optional `expected_response`, and the test asserts the optimizer status and, with `numpy.isclose`, the objective value. Add a scenario by dropping in a JSON file.
-- For behavior the data driven harness cannot assert, such as a specific charge schedule, construct an `Optimizer` directly in a dedicated test module and assert on the returned dict.
+- A test case with `"strict": true` additionally compares grid import, grid export, and the battery schedules with `numpy.allclose`. Use it for features that only pick between cost neutral alternatives, where the objective value barely moves. Do not set it on scenarios with several equally optimal schedules, the comparison would be arbitrary.
+- Prefer a data driven case over a dedicated test module, so a failure points at the scenario rather than at a feature specific script.
 - Cover both the success and the limit violation paths.
 
 ## Writing Style
