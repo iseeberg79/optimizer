@@ -89,7 +89,6 @@ class BatteryConfig:
     c_priority: int = 0
     prc_dpl_soc_high: float = 0.0  # price (€/h) for life depletion while sitting above 80% SOC
     prc_dpl_soc_low: float = 0.0  # price (€/h) for reserve comfort while sitting below 20% SOC (soft buffer, not aging)
-    battery_first: bool = False  # tie-break: prefer charging this battery as early as cost-neutral
 
 
 @dataclass
@@ -447,16 +446,6 @@ class Optimizer:
             for t in self.time_steps:
                 objective += self.variables['c'][i][t] * self.min_import_price * 5e-5 * (self.T - t) * bat.c_priority
                 objective += self.variables['d'][i][t] * self.min_import_price * 5e-5 * (self.T - t) * bat.c_priority
-
-        # battery_first: tie-break independent of charging_strategy, prefer charging this
-        # battery as early as possible when otherwise cost-neutral (real costs - price arbitrage,
-        # prc_dpl_soc_high/low - dominate this by construction, so it only resolves ties left open
-        # by the strategy/economics, e.g. a battery idling mid-band with no cost difference between
-        # charging now or later).
-        for i, bat in enumerate(self.batteries):
-            if bat.battery_first:
-                for t in self.time_steps:
-                    objective += self.variables['c'][i][t] * self.min_import_price * 2e-5 * (self.T - t)
 
         self.objective_scale = objective_scale(objective)
         self.problem += objective * self.objective_scale

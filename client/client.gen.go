@@ -47,12 +47,6 @@ const (
 
 // BatteryConfig defines model for BatteryConfig.
 type BatteryConfig struct {
-	// BatteryFirst Tie-break, independent of charging_strategy: prefer charging this battery as early
-	// as possible whenever it is otherwise cost-neutral. Real costs (price arbitrage,
-	// prc_dpl_soc_high/low) always dominate this preference, so it only resolves ties
-	// the strategy/economics leave open.
-	BatteryFirst bool `json:"battery_first,omitempty"`
-
 	// CMax Maximum charge power in W
 	CMax float32 `json:"c_max"`
 
