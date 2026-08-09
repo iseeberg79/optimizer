@@ -36,7 +36,7 @@ def test_no_ramp_term_is_left_in_the_model():
     assert not any(v.name.startswith(('p_imp_ramp', 'p_exp_ramp')) for v in model.problem.variables())
 
 
-def test_peak_variables_exist_only_for_the_leveled_sides():
+def test_peak_and_deviation_variables_exist_only_for_the_leveled_sides():
     demand = build(strategy='attenuate_demand_peaks')
     both = build(strategy='attenuate_grid_peaks')
     none = build(strategy='none')
@@ -44,8 +44,11 @@ def test_peak_variables_exist_only_for_the_leveled_sides():
         model.create_model()
 
     assert 'p_imp_peak' in demand.variables and 'p_exp_peak' not in demand.variables
+    assert 'p_imp_dev' in demand.variables and 'p_exp_dev' not in demand.variables
     assert 'p_imp_peak' in both.variables and 'p_exp_peak' in both.variables
+    assert 'p_imp_dev' in both.variables and 'p_exp_dev' in both.variables
     assert 'p_imp_peak' not in none.variables and 'p_exp_peak' not in none.variables
+    assert 'p_imp_dev' not in none.variables and 'p_exp_dev' not in none.variables
 
 
 def test_the_peak_term_spreads_the_charge_over_the_horizon():
@@ -62,14 +65,14 @@ def test_the_peak_term_spreads_the_charge_over_the_horizon():
     assert power.max() < 5000.
 
 
-def test_a_pinned_peak_leaves_the_steps_below_it_unordered():
+def test_a_pinned_peak_no_longer_leaves_the_steps_below_it_unordered():
     """
-    The blind spot of a peak term on its own, pinned so a change to it has to confront the case.
-
-    A 6 kW load spike the schedule cannot touch fixes the horizon maximum. The term prices that one
-    value, so once it is pinned nothing is left to win below it: charging flat out against the spike
-    and stopping scores exactly as well as spreading the same energy over the window. A step to step
-    ramp term used to order those two; this is what dropping it gives up.
+    The peak term alone has a blind spot: a load spike the schedule cannot touch fixes the horizon
+    maximum, and the term prices that one value, so once it is pinned nothing is left to win below
+    it - charging flat out against the spike and spreading the same energy over the window score
+    alike. The deviation term closes that gap by pricing distance from the horizon's own average
+    instead of from the neighboring step, so it rewards a plateau specifically, not just any smooth
+    transition (which is what a step to step ramp term rewarded, and why it was dropped in #130).
     """
     model = build(gt=[500., 500., 6000., 500., 500., 500., 500., 500.])
     model.batteries[0].s_goal = [0., 0., 0., 0., 0., 20000., 0., 0.]
@@ -78,15 +81,18 @@ def test_a_pinned_peak_leaves_the_steps_below_it_unordered():
     assert result['status'] == 'Optimal'
     power = import_power(model, result)
 
-    # the spike fixes the maximum and the peak term wins nothing below it
+    # the spike still fixes the maximum, the deviation term does not fight the peak term over it
     assert power.max() == pytest.approx(6000., abs=1.)
 
-    # the two readings of the profile below the spike carry the same energy at the same maximum,
-    # so the objective scores them alike however differently a mean square deviation would
+    # what the peak term alone cannot tell apart: charging flat out against the spike, against
+    # spreading the same energy over the window at the same maximum
     flat_out = numpy.array([6000., 6000., 6000., 1044., 1044., 1044., 500., 500.])
     spread = numpy.array([3026., 3026., 6000., 3026., 3026., 3026., 500., 500.])
     dt = numpy.array(model.time_series.dt, float)
-
     assert (flat_out * dt).sum() == pytest.approx((spread * dt).sum(), rel=1e-3)
     assert flat_out.max() == pytest.approx(spread.max())
-    assert spread.std() < flat_out.std() / 1.5
+
+    # the deviation term picks the spread reading: the schedule's own std lands next to it, well
+    # below the flat-out reading it used to be indistinguishable from
+    assert abs(power.std() - spread.std()) < abs(power.std() - flat_out.std())
+    assert power.std() < flat_out.std() / 1.3

@@ -14,6 +14,7 @@
 | | Final SOC value | `bat.p_a` | *(raw, now also feeds `penalty_base` directly)* | ~1.7e2 (up to whatever `p_a` is configured) | actual currency |
 | | Demand-rate charge | `grid.prc_p_exc_imp` | *(raw; `prc_p_exc_imp·3600/min(dt)` now also feeds `penalty_base`, only when `p_max_imp` makes the rate active)* | unbounded, but tier 1 now tracks it | actual currency |
 | **3 — tie-break nudges** | Peak leveling | `prc_p_peak = penalty_base·1e-3` | ×1e-3 | 0.16 – 300 | shape, not cost |
+| | Deviation leveling | `prc_p_dev = penalty_base·1e-5`, per step | ×1e-5 | 1.6e-3 – 3.0 | shape, not cost |
 | | Charge-before-export | `min_import_price·2e-5·(T−t)` | ×2e-5·(T−t) | ~1e-3 – tens | shape, not cost |
 | | Discharge-before-import | `min_import_price·5e-6·(T−t)` | ×5e-6·(T−t) | ~1e-4 – tens | shape, not cost |
 | | Charging priority | `min_import_price·5e-5·(T−t)·c_priority`, on `c` and on `d` | ×5e-5·(T−t)·c_priority | ~1e-3 – tens | shape, not cost |
@@ -25,15 +26,23 @@
   against the single-step case, which is the weaker of the two.
 - Peak leveling is charged once on a single value, not per step, so its weight does not grow with
   the horizon or change with the sampling.
-- Peak leveling has a blind spot. The maximum is one value out of the horizon, so once a load the
-  schedule cannot touch pins it, nothing orders the steps below it: a plateau, a jagged profile and
-  a single spike of the same energy score identically. A ramp leveling term at `penalty_base·1e-5`
-  used to order them; it was dropped because it priced transitions only, so it could not tell a
-  straight climb from a plateau either, and the second absolute value system over the same grid
-  power cost around a fifth of the solve time of a leveling case. `test_peak_leveling` pins both
-  halves.
+- Peak leveling has a blind spot on its own. The maximum is one value out of the horizon, so once a
+  load the schedule cannot touch pins it, nothing orders the steps below it: a plateau, a jagged
+  profile and a single spike of the same energy score identically. A ramp leveling term at
+  `penalty_base·1e-5` used to order them; it was dropped because it priced transitions only, so it
+  could not tell a straight climb from a plateau either, and the second absolute value system over
+  the same grid power cost around a fifth of the solve time of a leveling case.
+- Deviation leveling replaced it, pricing each step's distance from the horizon's own time weighted
+  average instead of from the neighboring step. That closes the peak term's blind spot on the
+  quality a ramp term could not tell apart either: a plateau scores best, a straight climb does not
+  score the same as one. It needs no variable of its own for the average (a linear expression over
+  the existing per-step grid energy), so it costs one variable and two constraints per step, the
+  same order as the dropped ramp term, but `tools/bench_peak_leveling.py --sweep` measures under 1 %
+  total solve time overhead on the stored cases against ~21 % lower deviation, worst case -64 %, and
+  never a higher peak or a higher cost, across 486 pinned-peak cases. `test_peak_leveling` pins the
+  blind spot closed.
 - The tier 3 terms keyed off `min_import_price` invert sign when market prices go negative, the
-  reason peak leveling uses `penalty_base` instead.
+  reason peak and deviation leveling use `penalty_base` instead.
 - Tier 3 is not solved together with the tiers above it. `solve()` maximizes tiers 1 and 2 first,
   then maximizes tier 3 over the schedules that keep that value, so the distance between the tiers
   no longer decides whether a preference is respected. The ranges listed above are what the second
