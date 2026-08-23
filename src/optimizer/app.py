@@ -116,7 +116,8 @@ battery_config_model = api.model('BatteryConfig', {
     'c_max': fields.Float(required=True, description='Maximum charge power (W)'),
     'd_max': fields.Float(required=True, description='Maximum discharge power (W)'),
     'p_a': fields.Float(required=True, description='Monetary value per Wh at end of the optimization horizon'),
-    'c_priority': fields.Integer(required=False, description='Charging and discharging priority compared to other batteries. 2 = highest priority.')
+    'c_priority': fields.Integer(required=False, description='Charging and discharging priority compared to other batteries. 2 = highest priority.'),
+    'c_continuous': fields.Boolean(required=False, description='Penalize charge on/off cycling so the solver prefers fewer, longer charging runs at reduced power over several short bursts up to c_max. Only effective together with c_min > 0.')
 })
 
 time_series_model = api.model('TimeSeries', {
@@ -207,6 +208,7 @@ class OptimizeCharging(Resource):
                     d_max=bat_data['d_max'],
                     p_a=bat_data['p_a'],
                     c_priority=bat_data.get('c_priority', 0),
+                    c_continuous=bat_data.get('c_continuous', False),
                 ))
 
             # Parse time series data

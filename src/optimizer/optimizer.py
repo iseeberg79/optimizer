@@ -136,6 +136,10 @@ class BatteryConfig:
     p_demand: Optional[List[float]] = None  # Minimum charge demand (Wh)
     s_goal: Optional[List[float]] = None  # Goal state of charge (Wh)
     c_priority: int = 0
+    # penalize charge activations (0 -> 1 transitions of z_c) so the solver prefers fewer, longer
+    # charging runs at reduced power over several short bursts up to c_max. Only effective together
+    # with c_min > 0, since z_c (the on/off state this counts transitions of) only exists then.
+    c_continuous: bool = False
 
 
 @dataclass
@@ -233,6 +237,12 @@ class Optimizer:
         # power cost around a fifth of the solve time of a leveling case. See the blind spot noted
         # in _add_energy_balance_constraints for what its removal gives up.
         self.prc_p_peak = self.penalty_base * 1e-3
+
+        # weight for the charge-activation penalty (bat.c_continuous). Same order of magnitude as
+        # prc_p_peak so it competes in the same preference stage without dominating it. penalty_base
+        # rather than min_import_price, for the same reason as prc_p_peak: a negative market price
+        # would otherwise turn this penalty into a reward for switching on and off.
+        self.prc_p_act = self.penalty_base * 1e-3
 
         # grid sides leveled by the active peak attenuation strategy, empty for all other strategies
         self.peak_sides = PEAK_STRATEGY_SIDES.get(strategy.charging_strategy, ())
@@ -353,6 +363,20 @@ class Optimizer:
             else:
                 self.variables['z_c'][i] = None
 
+        # Binary variable marking a charge activation (0 -> 1 transition of z_c), used to penalize
+        # frequent on/off cycling for batteries requesting continuous charging (bat.c_continuous).
+        # Only created where z_c itself exists (c_min > 0); there's no on/off state to count
+        # transitions of otherwise.
+        self.variables['z_start'] = {}
+        for i, bat in enumerate(self.batteries):
+            if bat.c_continuous and self.variables['z_c'][i] is not None:
+                self.variables['z_start'][i] = [
+                    pulp.LpVariable(f"z_start_{i}_{t}", cat='Binary')
+                    for t in self.time_steps
+                ]
+            else:
+                self.variables['z_start'][i] = None
+
         # Binary variable to lock charging against discharging
         self.variables['z_cd'] = {}
         for i, bat in enumerate(self.batteries):
@@ -467,6 +491,13 @@ class Optimizer:
             for i, bat in enumerate(self.batteries):
                 for t in self.time_steps:
                     preference += - self.variables['n'][t] * self.min_import_price * 5e-6 * (self.T - t)
+
+        # penalize charge activations for batteries requesting continuous charging, so the solver
+        # prefers one longer run at reduced power over several short bursts up to c_max
+        for i, bat in enumerate(self.batteries):
+            if self.variables['z_start'][i] is not None:
+                for t in self.time_steps:
+                    preference += - self.variables['z_start'][i][t] * self.prc_p_act
 
         # charging and discharging priorities
         for i, bat in enumerate(self.batteries):
@@ -679,6 +710,15 @@ class Optimizer:
                                      * self.variables['z_c'][i][t])
                     self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
                                      * self.variables['z_c'][i][t])
+
+            # charge-activation tracking for the continuous-charging preference: z_start marks a
+            # 0 -> 1 transition of z_c. Only an inequality is needed, the preference objective
+            # pushes z_start to its lower bound of 0 wherever z_c did not just turn on.
+            if self.variables['z_start'][i] is not None:
+                for t in self.time_steps:
+                    previous_z_c = self.variables['z_c'][i][t - 1] if t > 0 else 0
+                    self.problem += (self.variables['z_start'][i][t]
+                                     >= self.variables['z_c'][i][t] - previous_z_c)
 
             # control battery charging from grid
             if not bat.charge_from_grid:
