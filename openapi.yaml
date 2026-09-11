@@ -287,13 +287,6 @@ components:
             deviation. A linear cost model is applied, starting at 20% SOC, applying full price at
             s_min. Kept small so it never justifies grid charging to hold the band.
             Default 0 (disabled); the caller sets the value. Capacity is s_capacity or s_max.
-        c_continuous:
-          type: boolean
-          default: false
-          description: |
-            Penalize charge on/off cycling so the solver prefers fewer, longer charging runs at
-            reduced power over several short bursts up to c_max. Only effective together with
-            c_min > 0, otherwise there's no on/off state to penalize transitions of.
 
     TimeSeries:
       type: object

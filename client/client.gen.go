@@ -47,11 +47,6 @@ const (
 
 // BatteryConfig defines model for BatteryConfig.
 type BatteryConfig struct {
-	// CContinuous Penalize charge on/off cycling so the solver prefers fewer, longer charging runs at
-	// reduced power over several short bursts up to c_max. Only effective together with
-	// c_min > 0, otherwise there's no on/off state to penalize transitions of.
-	CContinuous bool `json:"c_continuous,omitempty"`
-
 	// CMax Maximum charge power in W
 	CMax float32 `json:"c_max"`
 
