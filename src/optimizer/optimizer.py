@@ -146,6 +146,7 @@ class BatteryConfig:
     c_priority: int = 0
     prc_dpl_soc_high: float = 0.0  # price (€/h) for life depletion while sitting above 80% SOC
     prc_dpl_soc_low: float = 0.0  # price (€/h) for reserve comfort while sitting below 20% SOC (soft buffer, not aging)
+    c_active: bool = False  # Whether the device is charging at the start of the horizon
 
 
 @dataclass
@@ -857,22 +858,30 @@ class Optimizer:
         self.problem.status = pulp.LpStatusOptimal
 
     def _solve_continuity(self, tmpdir: str, deadline: float | None) -> None:
-        """Prefer fewer charge starts without trading away economics or existing preferences."""
+        """Prefer fewer charge starts without trading away economics or existing preferences.
+
+        A device reported as charging enters the horizon switched on, so keeping it on is free and
+        interrupting it costs a start.
+        """
         if (self.problem.sol_status not in (pulp.LpSolutionOptimal, pulp.LpSolutionIntegerFeasible)
                 or not _complete_solution(self.problem) or not self._is_integral()):
             return
 
         eligible = [i for i, active in self.variables['z_c'].items() if active is not None]
 
+        def charging_now(i: int) -> int:
+            return int(self.batteries[i].c_active)
+
         def count_starts() -> list[int]:
             counts = []
             for i in eligible:
                 active = np.array([pulp.value(v) for v in self.variables['c'][i]]) > CONTINUITY_TOLERANCE
-                counts.append(int(np.count_nonzero(active & ~np.r_[False, active[:-1]])))
+                counts.append(int(np.count_nonzero(active & ~np.r_[bool(charging_now(i)), active[:-1]])))
             return counts
 
         before = count_starts()
-        if not any(count > 1 for count in before):
+        # a device that is charging already can reach zero starts, one that is idle needs one
+        if all(count <= 1 - charging_now(i) for i, count in zip(eligible, before)):
             return
         remaining = CONTINUITY_TIME_LIMIT if deadline is None else min(CONTINUITY_TIME_LIMIT, deadline - time.monotonic())
         if remaining <= 0:
@@ -898,7 +907,7 @@ class Optimizer:
             active = self.variables['z_c'][i]
             for t in self.time_steps:
                 start = pulp.LpVariable(f'charge_start_{i}_{t}', lowBound=0, upBound=1)
-                candidate += start >= active[t] - (active[t - 1] if t else 0)
+                candidate += start >= active[t] - (active[t - 1] if t else charging_now(i))
                 starts.append(start)
         candidate.setObjective(-pulp.lpSum(starts))
 
