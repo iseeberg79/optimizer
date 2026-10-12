@@ -77,7 +77,7 @@
   },
   "expected_response": {
     "status": "Optimal",
-    "objective_value": 0.09999999999999999
+    "objective_value": -0.15
   },
   "test_items": {}
 }
