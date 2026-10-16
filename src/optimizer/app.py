@@ -420,7 +420,7 @@ class ExplainPlan(Resource):
 
         Renders the plan as text and asks a chat model why it looks the way it does.
         """
-        if not settings.azure_openai_endpoint or not settings.azure_openai_key:
+        if not explain.configured(settings):
             api.abort(503, "Plan explanations are not configured")
 
         data = plan_payload()

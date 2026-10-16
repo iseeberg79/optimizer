@@ -107,6 +107,24 @@ def test_explain_reports_model_errors(payload, configured, monkeypatch):
     assert response.json['message'] == 'model returned 429: slow down'
 
 
+def test_explain_asks_claude_when_an_anthropic_key_is_set(monkeypatch):
+    seen = {}
+
+    def fake_post(url, headers, body):
+        seen.update(url=url, headers=headers, body=body)
+        return {'content': [{'type': 'text', 'text': 'Sunny.'}], 'usage': {'input_tokens': 100, 'output_tokens': 20}}
+
+    monkeypatch.setattr(settings, 'anthropic_api_key', 'test-key')
+    monkeypatch.setattr(explain, 'post', fake_post)
+    messages = [{'role': 'system', 'content': 'rules'}, {'role': 'user', 'content': 'plan'}]
+
+    assert explain.chat(settings, messages) == ('Sunny.', {'total_tokens': 120})
+    assert seen['url'] == 'https://api.anthropic.com/v1/messages'
+    assert seen['headers']['x-api-key'] == 'test-key'
+    assert seen['body']['system'] == 'rules'
+    assert seen['body']['messages'] == [{'role': 'user', 'content': 'plan'}]
+
+
 @pytest.mark.parametrize('drop', ['req', 'res'])
 def test_explain_requires_request_and_response(payload, configured, drop):
     del payload[drop]

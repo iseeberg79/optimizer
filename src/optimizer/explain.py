@@ -217,8 +217,44 @@ def digest(payload):
     return '\n'.join(lines)
 
 
+def configured(settings):
+    return bool(settings.anthropic_api_key or (settings.azure_openai_endpoint and settings.azure_openai_key))
+
+
+def post(url, headers, body):
+    request = urllib.request.Request(url, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json', **headers}, method='POST')
+    try:
+        with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors='replace')[:200]
+        raise ExplainError(f'model returned {e.code}: {detail}') from e
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        raise ExplainError(f'model unreachable: {e}') from e
+
+
+def chat_claude(settings, messages):
+    """One message against the Anthropic API. Returns the text and the usage."""
+    body = {
+        'model': settings.anthropic_model,
+        'max_tokens': 1500,
+        'system': messages[0]['content'],
+        'messages': messages[1:],
+    }
+    headers = {'x-api-key': settings.anthropic_api_key, 'anthropic-version': '2023-06-01'}
+    data = post('https://api.anthropic.com/v1/messages', headers, body)
+    try:
+        usage = data.get('usage') or {}
+        return data['content'][0]['text'], {'total_tokens': usage.get('input_tokens', 0) + usage.get('output_tokens', 0)}
+    except (KeyError, IndexError, TypeError) as e:
+        raise ExplainError('model returned no answer') from e
+
+
 def chat(settings, messages):
-    """One chat completion against the Azure OpenAI v1 API. Returns the text and the usage."""
+    """One chat completion, against Claude when an Anthropic key is set, else the Azure OpenAI v1 API. Returns the text and the usage."""
+    if settings.anthropic_api_key:
+        return chat_claude(settings, messages)
+
     body = {
         'model': settings.azure_openai_deployment,
         'messages': messages,
@@ -226,21 +262,7 @@ def chat(settings, messages):
         'reasoning_effort': 'low',
         'max_completion_tokens': 1500,
     }
-    request = urllib.request.Request(
-        settings.azure_openai_endpoint.rstrip('/') + '/openai/v1/chat/completions',
-        data=json.dumps(body).encode(),
-        headers={'Content-Type': 'application/json', 'api-key': settings.azure_openai_key},
-        method='POST',
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT) as resp:
-            data = json.load(resp)
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors='replace')[:200]
-        raise ExplainError(f'model returned {e.code}: {detail}') from e
-    except (urllib.error.URLError, TimeoutError, ValueError) as e:
-        raise ExplainError(f'model unreachable: {e}') from e
-
+    data = post(settings.azure_openai_endpoint.rstrip('/') + '/openai/v1/chat/completions', {'api-key': settings.azure_openai_key}, body)
     try:
         return data['choices'][0]['message']['content'], data.get('usage') or {}
     except (KeyError, IndexError, TypeError) as e:
