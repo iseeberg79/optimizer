@@ -10,6 +10,7 @@ from flask import Flask, after_this_request, g, jsonify, request
 from flask_restx import Api, Resource, fields
 from werkzeug.exceptions import BadRequest
 
+from . import explain, feedback
 from .optimizer import CHARGING_STRATEGIES, DISCHARGING_STRATEGIES, BatteryConfig, GridConfig, OptimizationStrategy, Optimizer, TimeSeriesData
 from .settings import OptimizerSettings
 
@@ -173,16 +174,16 @@ grid_model = api.model('GridConfig', {
 battery_config_model = api.model('BatteryConfig', {
     'charge_from_grid': fields.Boolean(required=False, description='Controls whether the battery can be charged from the grid.'),
     'discharge_to_grid': fields.Boolean(required=False, description='Controls whether the battery can discharge to grid.'),
-    's_capacity': fields.Float(required=False, description='Capacity at 100% state of charge (Wh)'),
-    's_min': fields.Float(required=True, description='Minimum state of charge (Wh)'),
-    's_max': fields.Float(required=True, description='Maximum state of charge (Wh)'),
-    's_initial': fields.Float(required=True, description='Initial state of charge (Wh)'),
+    's_capacity': fields.Float(required=False, min=0, description='Capacity at 100% state of charge (Wh)'),
+    's_min': fields.Float(required=True, min=0, description='Minimum state of charge (Wh)'),
+    's_max': fields.Float(required=True, min=0, description='Maximum state of charge (Wh)'),
+    's_initial': fields.Float(required=True, min=0, description='Initial state of charge (Wh)'),
     'p_demand': fields.List(fields.Float, required=False, description='Minimum charge demand per time step (Wh)'),
     's_goal': fields.List(fields.Float, required=False, description='Goal state of charge at each time step (Wh)'),
-    'c_min': fields.Float(required=True, description='Minimum charge power (W)'),
-    'c_max': fields.Float(required=True, description='Maximum charge power (W)'),
+    'c_min': fields.Float(required=True, min=0, description='Minimum charge power (W)'),
+    'c_max': fields.Float(required=True, min=0, description='Maximum charge power (W)'),
     'c_active': fields.Boolean(required=False, description='Whether the device is charging at the start of the time horizon.'),
-    'd_max': fields.Float(required=True, description='Maximum discharge power (W)'),
+    'd_max': fields.Float(required=True, min=0, description='Maximum discharge power (W)'),
     'p_a': fields.Float(required=True, description='Monetary value per Wh at end of the optimization horizon'),
     'c_priority': fields.Integer(required=False, description='Charging and discharging priority compared to other batteries. 2 = highest priority.'),
     'prc_dpl_soc_high': fields.Float(required=False, description='Price (€/h) for higher battery life depletion when sitting above 80% SOC.'),
@@ -309,6 +310,16 @@ class OptimizeCharging(Resource):
             if lengths['dt'] == 0:
                 api.abort(400, "Time series must not be empty")
 
+            # contradictory limits came back as a bare Infeasible with nothing naming the battery:
+            # c_min above c_max can never charge, s_initial above s_capacity has no state to start from
+            for i, bat in enumerate(batteries):
+                if bat.c_min > bat.c_max:
+                    api.abort(400, "Minimum charge power must not exceed maximum charge power",
+                              details={f'batteries.{i}.c_min': f'{bat.c_min} exceeds c_max {bat.c_max}'})
+                if bat.s_initial > bat.s_capacity:
+                    api.abort(400, "Initial state of charge must not exceed capacity",
+                              details={f'batteries.{i}.s_initial': f'{bat.s_initial} exceeds s_capacity {bat.s_capacity}'})
+
         except BadRequest:
             raise
         except Exception as e:
@@ -368,6 +379,89 @@ class OptimizeCharging(Resource):
 
         except Exception as e:
             api.abort(500, f"Optimization failed: {str(e)}")
+
+
+explain_input_model = api.model('ExplainInput', {
+    'req': fields.Nested(optimization_input_model, required=True, description='The request the plan was computed from'),
+    'res': fields.Nested(optimization_result_model, required=True, description='The plan returned for it'),
+    'details': fields.Raw(required=False, description='Request details as evcc publishes them: timestamp per step, '
+                                                      'batteryDetails with title, type and capacity per battery'),
+    'currency': fields.String(required=False, description='Currency of the prices, EUR by default'),
+    'language': fields.String(required=False, description='Language of the explanation as an IETF tag such as de, en by default'),
+})
+
+explain_result_model = api.model('ExplainResult', {
+    'explanation': fields.String(description='Explanation of the plan, markdown'),
+})
+
+explain_feedback_model = api.inherit('ExplainFeedback', explain_input_model, {
+    'explanation': fields.String(required=True, description='The explanation as returned by /optimize/explain'),
+    'vote': fields.String(required=True, enum=['up', 'down'], description='Whether the explanation helped'),
+    'comment': fields.String(required=False, description='What was wrong or missing, optional'),
+})
+
+
+def plan_payload():
+    """The validated payload; the result model documents its fields but requires none of them."""
+    data = api.payload
+    for key in ('status', 'batteries'):
+        if key not in data['res']:
+            api.abort(400, f"res.{key} is a required property")
+    return data
+
+
+@ns.route('/explain')
+class ExplainPlan(Resource):
+    @api.expect(explain_input_model, validate=True)
+    @api.marshal_with(explain_result_model)
+    def post(self):
+        """
+        Explain an optimizer plan in plain language
+
+        Renders the plan as text and asks a chat model why it looks the way it does.
+        """
+        if not settings.azure_openai_endpoint or not settings.azure_openai_key:
+            api.abort(503, "Plan explanations are not configured")
+
+        data = plan_payload()
+
+        started = time.perf_counter()
+        try:
+            text, usage = explain.explain(data, settings)
+        except explain.ExplainError as e:
+            api.abort(502, str(e))
+
+        # one JSON line per request, so the model cost can be read against the client that caused it
+        print(json.dumps({"explain": {
+            "client": request.headers.get('User-Agent'),
+            "elapsed": round(time.perf_counter() - started, 3),
+            "steps": len(data['req']['time_series']['dt']),
+            "tokens": usage.get('total_tokens'),
+        }}), flush=True)
+
+        return {'explanation': text}
+
+
+@ns.route('/explain/feedback')
+class ExplainFeedback(Resource):
+    @api.expect(explain_feedback_model, validate=True)
+    def post(self):
+        """
+        Vote on an explanation
+
+        Stores the plan, the explanation it got and the thumbs up or down with an optional comment.
+        Nothing is stored until a user votes.
+        """
+        if not feedback.configured(settings):
+            api.abort(503, "Explanation feedback is not configured")
+
+        data = plan_payload()
+        try:
+            feedback.store(settings, data, explain.digest(data), explain.SYSTEM_PROMPT, g.get('subject'))
+        except Exception as e:
+            api.abort(502, f"feedback not stored: {str(e)[:200]}")
+
+        return {}
 
 
 @ns.route('/health')
