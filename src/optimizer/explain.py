@@ -243,11 +243,11 @@ def chat_claude(settings, messages):
     }
     headers = {'x-api-key': settings.anthropic_api_key, 'anthropic-version': '2023-06-01'}
     data = post('https://api.anthropic.com/v1/messages', headers, body)
-    try:
-        usage = data.get('usage') or {}
-        return data['content'][0]['text'], {'total_tokens': usage.get('input_tokens', 0) + usage.get('output_tokens', 0)}
-    except (KeyError, IndexError, TypeError) as e:
-        raise ExplainError('model returned no answer') from e
+    text = ''.join(block.get('text', '') for block in data.get('content') or [] if block.get('type') == 'text')
+    if not text:
+        raise ExplainError(f"model returned no answer, stop reason {data.get('stop_reason')}")
+    usage = data.get('usage') or {}
+    return text, {'total_tokens': usage.get('input_tokens', 0) + usage.get('output_tokens', 0)}
 
 
 def chat(settings, messages):
