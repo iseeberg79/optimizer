@@ -238,6 +238,8 @@ def chat_claude(settings, messages):
     body = {
         'model': settings.anthropic_model,
         'max_tokens': 1500,
+        # the plan is a table to read, thinking would eat the token budget before the first word of the answer
+        'thinking': {'type': 'disabled'},
         'system': messages[0]['content'],
         'messages': messages[1:],
     }
