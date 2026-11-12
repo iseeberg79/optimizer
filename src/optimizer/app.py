@@ -85,7 +85,8 @@ DUMP_GAP = 1.0
 def dump_slow_request(payload, elapsed, gap, status=None, subject=None, client=None):
     """Persist requests worth replaying: those that exhausted the solver time limit, those the
     cost stage left more than DUMP_GAP of money unproven on, and those that came back without a
-    schedule: infeasible, or not solved within the stage caps.
+    schedule: infeasible, not solved within the stage caps, or failed with an exception, whose
+    class name is the status.
 
     The elapsed time covers model building as well as solving, so a request that only exceeds
     the limit while building is caught too. That one is equally worth looking at.
@@ -190,12 +191,19 @@ battery_config_model = api.model('BatteryConfig', {
     'prc_dpl_soc_low': fields.Float(required=False, description='Price (€/h) for reserve comfort when sitting below 20% SOC, ramping to full at s_min (soft buffer to keep the battery off the floor). Default 0 (disabled); the caller sets the value.')
 })
 
+# 100 MWh per step, far above any site evcc serves
+MAX_STEP_ENERGY = 1e8
+
 time_series_model = api.model('TimeSeries', {
     # the example is what the Swagger UI on / prefills, one step like its other series. A zero length step divides by zero
     'dt': fields.List(fields.Float(exclusiveMin=0), required=True, example=[3600],
                       description='duration in seconds for each time step (s)'),
-    'gt': fields.List(fields.Float, required=True, description='Required energy for home consumption at each time step (Wh)'),
-    'ft': fields.List(fields.Float, required=True, description='Forecasted solar generation at each time step (Wh)'),
+    # a broken household profile sent 1e9 to 1e16 Wh per step: HiGHS returns no solution for such
+    # coefficients and the request ended Not Solved instead of naming the bad step
+    'gt': fields.List(fields.Float(max=MAX_STEP_ENERGY), required=True,
+                      description='Required energy for home consumption at each time step (Wh)'),
+    'ft': fields.List(fields.Float(max=MAX_STEP_ENERGY), required=True,
+                      description='Forecasted solar generation at each time step (Wh)'),
     'p_N': fields.List(fields.Float, required=True, description='Price per Wh taken from grid at each time step'),
     'p_E': fields.List(fields.Float, required=True, description='Remuneration per Wh fed into grid at each time step'),
 })
@@ -380,6 +388,9 @@ class OptimizeCharging(Resource):
             return result
 
         except Exception as e:
+            # a failing solve is deterministic per request, so the dump is what makes it reproducible
+            dump_slow_request(data, time.perf_counter() - g.started, None, type(e).__name__, g.get('subject'),
+                              request.headers.get('User-Agent'))
             api.abort(500, f"Optimization failed: {str(e)}")
 
 

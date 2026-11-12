@@ -1,8 +1,11 @@
 import os
+import re
+import subprocess
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from functools import cache
 from math import isfinite
 from tempfile import TemporaryDirectory
 from typing import Dict, List, Optional
@@ -253,6 +256,19 @@ class TimeSeriesData:
     p_E: List[float]  # Export prices [currency unit/Wh]
 
 
+@cache
+def cbc_takes_mip_start(path: str) -> bool:
+    """Whether the CBC binary at path handles a MIP start on a maximization model.
+
+    Before 2.10.13 CBC set the cutoff of a MIP start with the sign of a minimization (Cbc bc74ac62).
+    On this model that returned a worse schedule as proven optimal, or declared it infeasible over a
+    cost bound the start satisfies. The image ships 2.10.13 on amd64 and Debian's 2.10.12 on arm64.
+    """
+    banner = subprocess.run([path], input='', capture_output=True, text=True, timeout=10, check=False).stdout
+    version = re.search(r'Version: (\d+)\.(\d+)\.(\d+)', banner)
+    return version is not None and tuple(map(int, version.groups())) >= (2, 10, 13)
+
+
 class Optimizer:
     """
     Optimizer class building the MILP model from the input data, and provides
@@ -292,6 +308,9 @@ class Optimizer:
         # money the cost stage could not rule out above its schedule, in currency. Zero when it
         # proved the value, None when it did not run.
         self.cost_stage_gap = None
+        # whether the money of the reported schedule is proven. The tie break proves only its own
+        # objective under the cost stage's bound, never that bound itself.
+        self.cost_stage_proven = True
         # 'joint' when the probe proved the whole objective, 'split' when it fell back
         self.solve_path = None
         # how the solve whose schedule sits in the variables ended. A stage that discards what it
@@ -908,6 +927,10 @@ class Optimizer:
             options.pop('logPath', None)
             # HiGHS also stops at a relative gap of 1e-4 by default, CBC only on the absolute one
             options.setdefault('gapRel', 0)
+            # trees here are a handful of nodes, so node cuts and the feasibility jump cost more than they
+            # win: 60 captured requests solve 5 to 6 percent faster without them, optima unchanged, see #320
+            options.setdefault('mip_allow_cut_separation_at_nodes', False)
+            options.setdefault('mip_heuristic_run_feasibility_jump', False)
             if self._cutoff is not None:
                 types = highspy.cb.HighsCallbackType
                 options.update(callbackTuple=(self._interrupt, None),
@@ -917,10 +940,25 @@ class Optimizer:
 
         # pulp resolves the binary unless one is configured: a cbc on PATH, the 2.10 release build
         # the image installs. The cbcbox wheel of the pulp cbc extra is deliberately not used, its
-        # devel build solves the captured requests 1.5 to 3 times slower
+        # devel build solves the captured requests 1.5 to 3 times slower.
         solver = pulp.COIN_CMD(path=self.settings.cbc_path, msg=0, threads=self.settings.num_threads, **options)
         solver.tmpDir = tmpdir
+        if options.get('warmStart') and not cbc_takes_mip_start(solver.path):
+            del solver.optionsDict['warmStart']
         return solver
+
+    def _solve(self, solver) -> pulp.LpSolveStats:
+        """Solve the problem, a HiGHS run that returns an incomplete solution counting as none.
+
+        pulp's HiGHS interface indexes the row solution by constraint id without checking its length,
+        and raises IndexError when HiGHS hands back fewer rows than the model has. In production this
+        turned up to 0.06 % of the requests into a 500, in the cost stage.
+        """
+        try:
+            return self.problem.solve(solver)
+        except IndexError as err:
+            print(f"{solver.name} returned an incomplete solution, treating it as none: {err!r}")
+            return pulp.LpSolveStats(solver=solver.name)
 
     def _interrupt(self, callback_type, message, data_out, data_in, user_data):
         """HiGHS interrupt callback: stop the solve once the _hard_limit deadline has passed.
@@ -1070,7 +1108,7 @@ class Optimizer:
         pinned = self._pin_integers()
         try:
             with self._timed('tie_break'):
-                stats = self.problem.solve(self._solver(tmpdir, timeLimit=LP_PREFERENCE_TIME_LIMIT))
+                stats = self._solve(self._solver(tmpdir, timeLimit=LP_PREFERENCE_TIME_LIMIT))
                 # CBC declares this LP infeasible on ~6% of production splits, over a bound the
                 # incumbent it just returned satisfies, see COST_BOUND_SLACK_CEILING. Walk the
                 # slack up until CBC can hold the row; keep() follows via budget.
@@ -1079,7 +1117,7 @@ class Optimizer:
                     slack *= 10
                     budget = self.settings.preference_budget + slack
                     slack_var.upBound = slack
-                    stats = self.problem.solve(self._solver(tmpdir, timeLimit=LP_PREFERENCE_TIME_LIMIT))
+                    stats = self._solve(self._solver(tmpdir, timeLimit=LP_PREFERENCE_TIME_LIMIT))
             label = 'LP' if slack == COST_BOUND_SLACK else f'LP (slack {slack:g})'
             stages.append(label + ' ' + stats.status_str + ('' if keep(stats) else ' unused'))
         finally:
@@ -1094,16 +1132,11 @@ class Optimizer:
         else:
             if remaining is not None:
                 remaining = min(remaining, self._clock(MILP_PREFERENCE_TIME_SHARE))
-            # no warm start, although a feasible solution is right there in the variables. CBC
-            # 2.10.3, which pulp 3 bundled, mishandled a MIP start on this model: it returned a
-            # strictly worse schedule and reported it as proven optimal, and it declared the model
-            # infeasible over a cost bound the start itself satisfies. Measured on one captured
-            # request, preference -0.806 warm against -0.610 cold, the cold value matching a single
-            # joint solve to the last digit. Fixed upstream, the same LP and the same start file
-            # come back identical to the cold run on CBC 2.10.13, but the image ships 2.10.10 and
-            # that one has not been checked, so this stays until it is.
+            # the best schedule so far is a feasible start for the MILP, handed on as a MIP start
+            for var, value in best.items():
+                var.varValue = value
             with self._timed('tie_break'):
-                stats = self.problem.solve(self._solver(tmpdir, timeLimit=remaining))
+                stats = self._solve(self._solver(tmpdir, timeLimit=remaining, warmStart=True))
             stages.append('MILP ' + stats.status_str + ('' if keep(stats) else ' unused'))
 
         self.preference_stage = ', '.join(stages)
@@ -1161,8 +1194,12 @@ class Optimizer:
                 if remaining <= 0:
                     self.continuity_stage = 'no time'
                     return
+            # the schedule in the variables is a feasible start; a start variable at 1 holds its row
+            by_name = {var.name: value for var, value in solution.items()}
+            for var in candidate.variables():
+                var.varValue = by_name.get(var.name, 1.)
             with self._timed('continuity'), self._hard_limit(remaining + CUTOFF_MARGIN):
-                stats = candidate.solve(self._solver(tmpdir, timeLimit=remaining))
+                stats = candidate.solve(self._solver(tmpdir, timeLimit=remaining, warmStart=True))
             self.continuity_stage = 'MILP ' + stats.status_str + ' unused'
             if not stats.has_solution or not _complete_solution(candidate):
                 return
@@ -1290,7 +1327,7 @@ class Optimizer:
         if probe != 0:
             try:
                 with self._timed('probe'):
-                    self.stats = self.problem.solve(self._solver(tmpdir, timeLimit=probe, gapAbs=scaled_gap))
+                    self.stats = self._solve(self._solver(tmpdir, timeLimit=probe, gapAbs=scaled_gap))
             except pulp.PulpSolverError as err:
                 # the probe is a shortcut, not the answer. A solver that fails on it (a non-zero
                 # exit once the clock stopped it has been reported) must not take the request down
@@ -1298,6 +1335,12 @@ class Optimizer:
                 print(f"probe failed, leaving the answer to the split: {err}")
                 probe_failed = True
                 probe = 0
+
+        # an infeasible model stays infeasible on the split, which would only spend the cost stage on it
+        if probe != 0 and self.stats.status == pulp.LpSolveStatus.Infeasible and not self.stats.has_solution:
+            self.solve_path = 'joint'
+            self.preference_stage = 'not needed'
+            return
 
         # a run stopped by the clock reports TimeLimit and carries whatever it found in has_solution.
         # Proven is what the probe is asking.
@@ -1322,10 +1365,12 @@ class Optimizer:
         reserve = (0. if self.settings.time_limit is None
                    else self.settings.time_limit * PREFERENCE_TIME_SHARE)
         remaining = None if deadline is None else max(min(self._clock(COST_TIME_SHARE), deadline - reserve - time.monotonic()), 0.1)
+        # the probe's schedule is the first incumbent, a bound under the search from the start
         with self._timed('cost'):
-            self.stats = self.problem.solve(self._solver(tmpdir, timeLimit=remaining, gapAbs=scaled_gap,
-                                                         logPath=os.path.join(tmpdir, 'cost.log')))
+            self.stats = self._solve(self._solver(tmpdir, timeLimit=remaining, gapAbs=scaled_gap,
+                                                  logPath=os.path.join(tmpdir, 'cost.log'), warmStart=fallback is not None))
         self.cost_stage_gap = self._stage_gap(self.stats, scale)
+        self.cost_stage_proven = self.stats.status in PROVEN
 
         if self.stats.has_solution and self._is_feasible():
             # the cost stage is allowed to stop on its gap, so proven is not required of it, only
@@ -1393,7 +1438,7 @@ class Optimizer:
         # 'Optimal' claiming more than it can back is the bug. The wording is the API contract and
         # predates pulp 4, which spells NotSolved without the space.
         if self.stats and self.stats.has_solution:
-            status = 'Optimal' if self.stats.status in PROVEN else 'Feasible'
+            status = 'Optimal' if self.stats.status in PROVEN and self.cost_stage_proven else 'Feasible'
         else:
             status = STATUS_LABELS.get(self.stats.status_str if self.stats else '', 'Not Solved')
 
