@@ -164,18 +164,6 @@ type BatteryConfig struct {
 	// PDemand Minimum charge demand per time step (Wh)
 	PDemand []float32 `json:"p_demand,omitempty"`
 
-	// PrcDplSocHigh Price (€/h) for higher battery life depletion when sitting at high SOC.
-	// A linear cost model is applied, starting at 80% SOC, applying full price at 100% SOC.
-	// The battery capacity is assumed to be s_capacity or s_max if s_capacity is not specified.
-	PrcDplSocHigh float32 `json:"prc_dpl_soc_high,omitempty"`
-
-	// PrcDplSocLow Price (€/h) for reserve comfort when sitting at low SOC. Not a battery-aging cost (low
-	// SOC is gentle) but a soft preference to keep a buffer for spontaneous loads / forecast
-	// deviation. A linear cost model is applied, starting at 20% SOC, applying full price at
-	// s_min. Kept small so it never justifies grid charging to hold the band.
-	// Default 0 (disabled); the caller sets the value. Capacity is s_capacity or s_max.
-	PrcDplSocLow float32 `json:"prc_dpl_soc_low,omitempty"`
-
 	// SCapacity The capacity at 100% SOC in Wh. If not specified s_capacity will be set to s_max.
 	// s_initial must be less or equal s_capacity, otherwise the optimization will return an error.
 	SCapacity float32 `json:"s_capacity,omitempty"`

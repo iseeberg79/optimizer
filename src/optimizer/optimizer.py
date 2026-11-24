@@ -243,8 +243,6 @@ class BatteryConfig:
     p_demand: Optional[List[float]] = None  # Minimum charge demand (Wh)
     s_goal: Optional[List[float]] = None  # Goal state of charge (Wh)
     c_priority: int = 0
-    prc_dpl_soc_high: float = 0.0  # price (€/h) for life depletion while sitting above 80% SOC
-    prc_dpl_soc_low: float = 0.0  # price (€/h) for reserve comfort while sitting below 20% SOC (soft buffer, not aging)
     c_active: bool = False  # Whether the device is charging at the start of the horizon
 
 
@@ -538,27 +536,6 @@ class Optimizer:
                 for t in self.time_steps
             ] if bat.c_max > 0 or bat.d_max > 0 else [0] * self.T
 
-        # Cost variable for battery life depletion while sitting at very high SOC (>80%).
-        # lowBound=0 makes the "no cost below 80%" floor implicit.
-        self.variables['cst_dpl_high'] = {}
-        for i, bat in enumerate(self.batteries):
-            # only priced batteries get the variables, an unused one still perturbs the solve
-            self.variables['cst_dpl_high'][i] = [
-                self.problem.add_variable(f"cst_dpl_high_{i}_{t}", lowBound=0)
-                for t in self.time_steps
-            ] if bat.prc_dpl_soc_high > 0 else []
-
-        # Cost variable for keeping a reserve buffer while sitting at very low SOC (<20%).
-        # Not aging (low SOC is gentle) but a comfort/reserve preference: a soft buffer for
-        # spontaneous loads / forecast deviation. lowBound=0 makes the "no cost above 20%" floor implicit.
-        self.variables['cst_dpl_low'] = {}
-        for i, bat in enumerate(self.batteries):
-            # only priced batteries get the variables, an unused one still perturbs the solve
-            self.variables['cst_dpl_low'][i] = [
-                self.problem.add_variable(f"cst_dpl_low_{i}_{t}", lowBound=0)
-                for t in self.time_steps
-            ] if bat.prc_dpl_soc_low > 0 else []
-
         # worst case recourse cost of the forecast error, see _add_uncertainty_constraints
         if self._hedged():
             self.variables['u_imp'] = [self.problem.add_variable(f"u_imp_{t}", lowBound=0) for t in self.time_steps]
@@ -601,16 +578,6 @@ class Optimizer:
         # Final state of charge value [currency unit]
         for i, bat in enumerate(self.batteries):
             objective += self.variables['s'][i][-1] * bat.p_a
-
-        # cost for depleting battery life by sitting at very high SOC (calendar aging)
-        for i in range(len(self.batteries)):
-            for var in self.variables['cst_dpl_high'][i]:
-                objective += - var
-
-        # cost for sitting at very low SOC (reserve comfort - keep a soft buffer for deviations)
-        for i in range(len(self.batteries)):
-            for var in self.variables['cst_dpl_low'][i]:
-                objective += - var
 
         # charge for import power demand rate. The demand rate is applied to the maximum
         # power draw beyond the threshold within the time horizon.
@@ -935,35 +902,6 @@ class Optimizer:
                 # Charge constraint
                 self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
                                  * (1 - self.variables['z_cd'][i][t]))
-
-            # cost for depleting battery life by sitting at very high SOC (calendar aging).
-            # linear ramp: zero at 80% SOC, full prc_dpl_soc_high at 100% SOC.
-            # capacity: s_capacity if set, else s_max (guard against div by zero).
-            if bat.prc_dpl_soc_high > 0:
-                bat_capacity = bat.s_capacity if (bat.s_capacity is not None and bat.s_capacity > 0.0) else bat.s_max
-                bat_capacity = max(bat_capacity, 1.0)
-                for t in self.time_steps:
-                    # scale the €/h price to the slot width
-                    prc = bat.prc_dpl_soc_high / 3600.0 * self.time_series.dt[t]
-                    self.problem += (self.variables['cst_dpl_high'][i][t]
-                                     >= (prc / (0.2 * bat_capacity))
-                                     * (self.variables['s'][i][t] - 0.8 * bat_capacity))
-
-            # reserve comfort while sitting at low SOC (NOT aging - low SOC is gentle): keep a soft
-            # buffer for spontaneous loads / forecast deviation. linear ramp: zero at 20% SOC, full
-            # prc_dpl_soc_low at s_min (the configured floor). Kept small so it only discourages
-            # needless draining and never justifies grid charging to hold the band.
-            if bat.prc_dpl_soc_low > 0:
-                bat_capacity = bat.s_capacity if (bat.s_capacity is not None and bat.s_capacity > 0.0) else bat.s_max
-                bat_capacity = max(bat_capacity, 1.0)
-                low_top = 0.2 * bat_capacity
-                low_width = low_top - bat.s_min
-                if low_width > 0:
-                    for t in self.time_steps:
-                        prc = bat.prc_dpl_soc_low / 3600.0 * self.time_series.dt[t]
-                        self.problem += (self.variables['cst_dpl_low'][i][t]
-                                         >= (prc / low_width)
-                                         * (low_top - self.variables['s'][i][t]))
 
     def _add_circuit_constraints(self):
         """Limit the charge power sum of the batteries sharing a circuit. Discharging is not counted."""
