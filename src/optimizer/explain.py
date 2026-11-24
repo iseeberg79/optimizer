@@ -37,17 +37,23 @@ import later. Stored energy is worth the price of the hours it replaces: a batte
 the expensive hours gains nothing from cheap night energy, that energy would only replace cheaper hours, where \
 the losses eat the gap.
 - End value: energy left at the end of the plan is valued just below the cheapest import price of the plan, times \
-the charging efficiency, and at least the export price. So surplus solar is stored even without a goal, buying \
+the charging efficiency. For a home battery it is at least the export price, for a vehicle it is not: a vehicle \
+cannot export. Charging loses another 10%, so a kWh of solar charged into a vehicle without a goal is worth about \
+80% of the cheapest import price of the plan. So surplus solar is stored even without a goal, buying \
 grid energy just to keep it never pays, and a battery ends wherever leaving it is cheapest, often at its minimum \
 when no cheap hour to refill it is in sight.
 - Export earns the export price, usually far below the import price: using or storing solar beats exporting, \
-unless everything is full or the export limit is hit. With a zero export price surplus is free to waste.
+unless everything is full or the export limit is hit. With a zero export price surplus is free to waste. A vehicle \
+without a goal is the exception: where the export price is above about 80% of the cheapest import price, exporting \
+pays more than charging it, and the plan exports even though the vehicle has room.
 - Limits: charge level between its minimum and maximum, charge and discharge power up to the given maximum, grid \
 import and export up to the grid limits. Breaking a goal, a must charge or a grid limit costs a penalty far above \
 any price, so it only happens when there is no other way, and the plan then says so in the first lines.
 - A charging goal is a charge level a vehicle should reach by a time, set by the owner in a charging plan. The \
 solver picks the cheapest slots before that time, in any order: among equally cheap slots which one it takes is \
-arbitrary, except that fewer charge starts are preferred.
+arbitrary, except that fewer charge starts are preferred. \
+A goal after the end of the plan is not in the input: without a goal, say no goal falls within this plan, never \
+that none is set.
 - "Must charge" is a required energy per slot: full power in fast mode, the minimum power for minimum charging, \
 full power in every slot below a price limit, full power in the last hours before a plan time for late charging, \
 and full power below the grid charge price limit for a home battery. It is dropped once the battery is full.
@@ -79,6 +85,7 @@ best do, but the inverter decides on its own: it charges from surplus and discha
 - Cheap night energy is not stored because tomorrow's solar will fill the battery anyway.
 - A battery keeps its charge for the expensive evening instead of covering cheap hours.
 - Solar is exported because every vehicle and battery is full.
+- Solar is exported instead of charging a vehicle without a goal because the export price pays more than charging it.
 - A battery empties early to make room for negative prices or for solar that could not be exported.
 - Several hours cost the same, so when exactly charging happens is arbitrary.
 - A charging goal cannot be reached in time, or the grid limit is reached.
@@ -96,12 +103,15 @@ obvious. Separate the intro, the list and the hints with a blank line. No headin
 bullet whether it charges from the grid and why: the price gap covers the losses, or it does not, the battery already \
 holds enough for the expensive hours, solar will fill it, or it may not charge from the grid. When the price varies \
 less, never mention charging or not charging a home battery from the grid, nor the losses.
+- When a vehicle charges at the grid import limit, a home battery discharging then covers the house: never say it \
+supplies, supports or holds energy for the vehicle.
 - Use the times as given: "tomorrow 14:00", "Saturday 10:00", "tonight", "from 18:00". Never write dates or years. \
 Ranges as "10:00 to 13:00".
 - Energy in kWh with one decimal, charge levels in %, prices in the unit given. Use the decimal separator of the \
 language you answer in.
 - Never use dashes as punctuation, write a full stop or a comma instead.
 - Never use: slot, step, horizon, objective, solver, SoC, Wh, loadpoint.
+- A vehicle with an unknown charge level shows - as its level: say how much energy it charges, never a level in %.
 - Call every vehicle and home battery by its name. Only cite numbers that are in the plan, do not compute new ones."""
 
 CHAT_TIMEOUT = 45  # seconds, below the gunicorn request timeout
@@ -181,7 +191,7 @@ def capacity_wh(bat, detail):
     return bat.get('s_capacity') or (detail['capacity'] * 1000 if detail.get('capacity') else bat['s_max']) or 1
 
 
-def battery_line(bat, detail, i, labels, capacity):
+def battery_line(bat, detail, i, labels, capacity, charged=0):
     kind = 'vehicle' if detail.get('type') == 'vehicle' else 'home battery'
     name = detail.get('name') or ''
     # untitled ui-configured devices are named db:<id>
@@ -192,10 +202,14 @@ def battery_line(bat, detail, i, labels, capacity):
     def pct(wh):
         return f'{round(wh / capacity * 100)}%'
 
+    # evcc sends the energy charged this session as state of a vehicle without soc: no level to name
+    unknown = detail.get('socUnknown')
     facts = [
         f"capacity {kwh(capacity)} kWh",
-        f"now {pct(bat['s_initial'])} ({kwh(bat['s_initial'])} kWh)",
-        f"kept between {pct(bat['s_min'])} and {pct(bat['s_max'])}",
+        *([f"charge level unknown, charges {kwh(charged)} kWh in this plan"] if unknown else [
+            f"now {pct(bat['s_initial'])} ({kwh(bat['s_initial'])} kWh)",
+            f"kept between {pct(bat['s_min'])} and {pct(bat['s_max'])}",
+        ]),
         f"charges up to {kwh(bat['c_max'])} kW" + (f", at least {kwh(bat['c_min'])} kW or not at all" if bat['c_min'] > 0 else ''),
         f"discharges up to {kwh(bat['d_max'])} kW" if bat['d_max'] > 0 else 'never discharges',
         'may charge from the grid' if bat.get('charge_from_grid') else 'no grid charging, only surplus solar',
@@ -204,7 +218,8 @@ def battery_line(bat, detail, i, labels, capacity):
         facts.append('may discharge into the grid' if bat.get('discharge_to_grid') else 'does not discharge into the grid')
     if bat.get('c_active'):
         facts.append('charging right now')
-    facts += [f'charging goal {pct(goal)} by {labels[t + 1]}' for t, goal in enumerate(bat.get('s_goal') or []) if goal > 0]
+    facts += [f'charging goal {kwh(goal - bat["s_initial"]) + " kWh more" if unknown else pct(goal)} by {labels[t + 1]}'
+              for t, goal in enumerate(bat.get('s_goal') or []) if goal > 0]
     facts += [f'must charge {run}' for run in ranges(bat.get('p_demand'), labels)]
     return title, f'{kind} "{title}": ' + ', '.join(facts)
 
@@ -218,11 +233,13 @@ def digest(payload):
     ts = req['time_series']
     labels = step_labels(ts['dt'], details.get('timestamp'))
 
-    titles, devices, capacities = [], [], []
+    titles, devices, capacities, unknown = [], [], [], []
     for i, bat in enumerate(req['batteries']):
         detail = at(details.get('batteryDetails'), i, {})
         capacities.append(capacity_wh(bat, detail))
-        title, line = battery_line(bat, detail, i, labels, capacities[-1])
+        unknown.append(bool(detail.get('socUnknown')))
+        charged = sum(at(res.get('batteries'), i, {}).get('charging_power') or [])
+        title, line = battery_line(bat, detail, i, labels, capacities[-1], charged)
         titles.append(title)
         devices.append(line)
 
@@ -253,8 +270,8 @@ def digest(payload):
             kwh(at(ts['ft'], i)), kwh(at(ts['gt'], i)),
             f"{kwh(at(res.get('grid_import'), i))}/{kwh(at(res.get('grid_export'), i))}",
             *(f"{kwh(at(b.get('charging_power'), i))}/{kwh(at(b.get('discharging_power'), i))}/"
-              f"{round(at(b.get('state_of_charge'), i) / capacity * 100)}"
-              for b, capacity in zip(res.get('batteries') or [], capacities)),
+              f"{'-' if level_unknown else round(at(b.get('state_of_charge'), i) / capacity * 100)}"
+              for b, capacity, level_unknown in zip(res.get('batteries') or [], capacities, unknown)),
         ]))
 
     return '\n'.join(lines)

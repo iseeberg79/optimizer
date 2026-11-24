@@ -249,6 +249,12 @@ class BatteryConfig:
 
 
 @dataclass
+class CircuitConfig:
+    p_max: float  # Maximum charge power sum of the listed batteries [W]
+    batteries: List[int]  # Indices into the batteries list
+
+
+@dataclass
 class TimeSeriesData:
     dt: List[int]  # time step length [s]
     gt: List[float]  # Required total energy [Wh]
@@ -298,7 +304,8 @@ class Optimizer:
 
     def __init__(self, strategy: OptimizationStrategy, grid: GridConfig, batteries: List[BatteryConfig], time_series: TimeSeriesData,
                  eta_c: float = 0.95, eta_d: float = 0.95, M: float = 1e6, optimizer_settings: OptimizerSettings | None = None,
-                 uncertainty: UncertaintyConfig | None = None):
+                 uncertainty: UncertaintyConfig | None = None,
+                 circuits: List[CircuitConfig] | None = None):
         """
         Optimizer Constructor
         """
@@ -310,6 +317,7 @@ class Optimizer:
         self.batteries = batteries
         self.time_series = time_series
         self.uncertainty = uncertainty or UncertaintyConfig()
+        self.circuits = circuits or []
         self.eta_c = eta_c
         self.eta_d = eta_d
         self.M = M
@@ -411,6 +419,7 @@ class Optimizer:
         self._add_energy_balance_constraints()
         self._add_battery_constraints()
         self._add_uncertainty_constraints()
+        self._add_circuit_constraints()
 
     def _setup_variables(self):
         """
@@ -555,7 +564,7 @@ class Optimizer:
             self.variables['u_imp'] = [self.problem.add_variable(f"u_imp_{t}", lowBound=0) for t in self.time_steps]
             self.variables['u_imp_sum'] = [self.problem.add_variable(f"u_imp_sum_{t}", lowBound=0) for t in self.time_steps]
             self.variables['u_chg'] = [self.problem.add_variable(f"u_chg_{t}", lowBound=0) for t in self.time_steps]
-            self.variables['u_res'] = self.problem.add_variable("u_res", lowBound=0)
+            self.variables['u_res'] = [self.problem.add_variable(f"u_res_{t}", lowBound=0) for t in self.time_steps]
 
     def _setup_target_function(self):
         """
@@ -645,15 +654,18 @@ class Optimizer:
                 objective += - self.prc_e_grid_exp_pen * (1.0 - t * 1e-5) * self.variables['e_exp_lim_exc'][t]
 
         # cost of the budgeted forecast error, see _add_uncertainty_constraints: the extra import it
-        # forces at the import price of the step it is drawn in, and the reserve it consumes at the
-        # export price. A negative price would reward drawing more, so it is floored at zero. A load
+        # forces at the import price of the step it is drawn in, and the reserve it consumes at what
+        # the plan values it. A negative price would reward drawing more, so it is floored at zero. A load
         # Wh refilled through the batteries costs the round trip.
         if self._hedged():
             for t in self.time_steps:
                 price = max(self.time_series.p_N[t], 0) * (1 - HEDGE_TIE_DISCOUNT)
                 objective -= self.variables['u_imp'][t] * price
                 objective -= self.variables['u_chg'][t] * price / (self.eta_c * self.eta_d)
-            objective -= self.variables['u_res'] * max(np.max(self.time_series.p_E), 0) * (1 - HEDGE_TIE_DISCOUNT)
+            # stored Wh the plan keeps are credited at p_a, in load Wh at the discharge efficiency
+            stored = max((bat.p_a for bat in self.batteries if bat.d_max > 0), default=0) / self.eta_d
+            reserve_price = max(np.max(self.time_series.p_E), stored, np.min(self.time_series.p_N), 0) * (1 - HEDGE_TIE_DISCOUNT)
+            objective -= pulp.lpSum(self.variables['u_res']) * reserve_price
 
         # everything above is real money. It is kept separate from the preference terms below
         # because solve() optimizes the two in sequence, see _solve_preferences().
@@ -854,6 +866,12 @@ class Optimizer:
                         self.problem += (self.variables['s'][i][t]
                                          + self.variables['s_goal_pen'][i][t] >= bat.s_goal[t])
 
+            # without discharge the room only shrinks, so a rest below c_min fills in one slot.
+            # The charger stops once the battery is full, that slot may charge less than c_min.
+            # A larger rest splits into slots of c_min to c_max each, so the constant bound suffices.
+            can_discharge = bat.d_max > 0
+            rest_to_fill = float('inf') if can_discharge else max(bat.s_max - bat.s_initial, 0.) / self.eta_c
+
             # Constraint: Minimum battery charge demand (for t > 0)
             if bat.p_demand is not None:
                 for t in self.time_steps:
@@ -882,9 +900,9 @@ class Optimizer:
 
                     if bat.c_min > 0:
                         # set constraints to exclude charging between 0 and c_min if z_p_demand is not 1.
-                        self.problem += (self.variables['c'][i][t]
-                                         + bat.c_min * self.time_series.dt[t] / 3600. * self.variables['z_p_demand'][i][t]
-                                         >= bat.c_min * self.time_series.dt[t] / 3600. * self.variables['z_c'][i][t])
+                        c_lower = min(bat.c_min * self.time_series.dt[t] / 3600., rest_to_fill)
+                        self.problem += (self.variables['c'][i][t] + c_lower * self.variables['z_p_demand'][i][t]
+                                         >= c_lower * self.variables['z_c'][i][t])
                         self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
                                          * self.variables['z_c'][i][t])
 
@@ -892,8 +910,8 @@ class Optimizer:
             elif bat.c_min > 0:
                 for t in self.time_steps:
                     # Lower bound: either 0 or at least c_min
-                    self.problem += (self.variables['c'][i][t] >= bat.c_min * self.time_series.dt[t] / 3600.
-                                     * self.variables['z_c'][i][t])
+                    c_lower = min(bat.c_min * self.time_series.dt[t] / 3600., rest_to_fill)
+                    self.problem += (self.variables['c'][i][t] >= c_lower * self.variables['z_c'][i][t])
                     self.problem += (self.variables['c'][i][t] <= bat.c_max * self.time_series.dt[t] / 3600.
                                      * self.variables['z_c'][i][t])
 
@@ -946,6 +964,13 @@ class Optimizer:
                         self.problem += (self.variables['cst_dpl_low'][i][t]
                                          >= (prc / low_width)
                                          * (low_top - self.variables['s'][i][t]))
+
+    def _add_circuit_constraints(self):
+        """Limit the charge power sum of the batteries sharing a circuit. Discharging is not counted."""
+        for circuit in self.circuits:
+            for t in self.time_steps:
+                self.problem += (pulp.lpSum(self.variables['c'][i][t] for i in circuit.batteries)
+                                 <= circuit.p_max * self.time_series.dt[t] / 3600.)
 
     def _hedged(self) -> bool:
         """Whether the model carries the hedge: a budget, and a step whose forecast can deviate."""
@@ -1001,9 +1026,13 @@ class Optimizer:
         The worst case looks back one day, see HEDGE_WINDOW, so it also falls, and u_imp_sum with
         it: what was booked against deviations that have left the window is released.
 
-        The reserve the worst case consumes instead, u_res, is priced at the export price, the
-        least that energy would have earned the plan. Free, the hedge would buy a reserve from the
-        grid on a flat tariff, where a shortfall costs the same whenever it is imported.
+        The reserve the worst case consumes instead, u_res, is priced at what the plan values that
+        energy at: the export price or the value of stored energy, p_a, whichever is higher, and no less
+        than the cheapest import, so on a flat tariff it ties with importing and the preferences decide. Free,
+        the hedge would buy a reserve from the grid on a flat tariff, where a shortfall costs the
+        same whenever it is imported. Below p_a, it would stop a discharge to keep a reserve whose
+        use costs the plan the credit it took for holding it. Every step prices what it adds, so a
+        large reserve later in the horizon does not make an earlier one free.
 
         Export the schedule only chooses is not known before the solve, so a deviation it would
         absorb still counts.
@@ -1032,8 +1061,9 @@ class Optimizer:
                                               + self.variables['s_min_pen'][i][t] for i in reserve_batteries)
             self.problem += running >= worst[t] - reserve
             self.problem += running <= worst[t]
-            # the reserve the worst case consumes instead of importing
-            self.problem += self.variables['u_res'] >= worst[t] - running
+            # the reserve the worst case consumes instead of importing, what step t adds to it
+            used_before = (worst[t - 1] - self.variables['u_imp_sum'][t - 1]) if t > 0 else 0
+            self.problem += self.variables['u_res'][t] >= (worst[t] - running) - used_before
 
     def _stage_solver(self) -> str:
         """The solver of the stage being timed: hybrid proves the joint probe on CBC and runs the rest on HiGHS.
